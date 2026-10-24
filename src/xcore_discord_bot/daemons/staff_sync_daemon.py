@@ -57,7 +57,7 @@ class StaffSyncDaemon:
             asyncio.create_task(self._run_loop(), name="staff_sync_daemon"),
             asyncio.create_task(
                 run_consumer_forever(
-                    self._bot,
+                    self._bot.bus,
                     "staff-link-status",
                     self._bot.bus.consume_discord_link_status_changed,
                     self.on_link_status,

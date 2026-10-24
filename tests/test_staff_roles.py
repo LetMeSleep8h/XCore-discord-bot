@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -8,6 +9,7 @@ import pytest
 from aiohttp import ClientConnectionError
 from bot_fakes import make_bot
 from pydantic import ValidationError
+from redis.exceptions import RedisError
 from xcore_protocol.generated.discord import (
     DiscordLinkStatusChangedV1,
     DiscordLinkStatusChangedV1Action,
@@ -328,6 +330,22 @@ async def test_schedule_loop_starts_after_ready_and_continues(setup, monkeypatch
         [600, 600], abs=0.1
     )
     assert daemon.reconcile.await_count == 2
+
+
+async def test_link_status_consumer_reconnects_the_bus(setup, monkeypatch):
+    daemon, _, _, _ = setup
+    bus = daemon._bot.bus
+    bus.consume_discord_link_status_changed = AsyncMock(
+        side_effect=[RedisError("connection lost"), asyncio.CancelledError()]
+    )
+    bus.reconnect = AsyncMock()
+    daemon._bot.wait_until_ready = AsyncMock(side_effect=asyncio.CancelledError())
+    monkeypatch.setattr(
+        "xcore_discord_bot.runtime_consumers.asyncio.sleep", AsyncMock()
+    )
+    daemon.start()
+    await asyncio.gather(*daemon._tasks, return_exceptions=True)
+    bus.reconnect.assert_awaited_once()
 
 
 async def test_roles_command_link_does_not_write_admin(settings):
