@@ -45,6 +45,7 @@ class PlayerRecord:
     created_at: object = None
     updated_at: object = None
 
+
 @dataclass(frozen=True, kw_only=True)
 class BanRecord:
     ban_id: int | None = None
