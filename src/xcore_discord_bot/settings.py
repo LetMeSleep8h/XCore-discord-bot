@@ -17,7 +17,9 @@ EMPTY_LIST_FIELDS = frozenset(
 class Settings(BaseSettings):
     """Read from the environment; field names match the variable names ignoring case."""
 
-    model_config = SettingsConfigDict(extra="ignore", frozen=True)
+    model_config = SettingsConfigDict(
+        extra="ignore", frozen=True, hide_input_in_errors=True
+    )
 
     permissions_mode: Literal["legacy", "roles"] = "legacy"
     permissions_config_path: str = ""
@@ -136,4 +138,4 @@ class Settings(BaseSettings):
                     problems.append(f"Missing required environment variable: {name}")
                 else:
                     problems.append(f"{name}: {item['msg']}" if name else item["msg"])
-            raise RuntimeError("; ".join(problems)) from error
+            raise RuntimeError("; ".join(problems)) from None

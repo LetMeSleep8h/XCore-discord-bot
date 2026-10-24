@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import traceback
+
 import pytest
 from pydantic import ValidationError
 
@@ -119,6 +121,10 @@ def test_settings_from_env_hides_values_of_other_variables(
     assert str(raised.value) == (
         "Missing required environment variable: DISCORD_ADMIN_ROLE_ID"
     )
+    # An uncaught error prints the whole chain; pydantic would echo the input there.
+    printed = "".join(traceback.format_exception(raised.value))
+    assert "input_value" not in printed
+    assert "secret" not in printed
 
 
 def test_settings_blank_ids_use_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
