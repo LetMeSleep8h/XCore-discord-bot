@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from bot_fakes import FAMILY_BUSES
 from cases_action_fakes import Players, mirror_audits
 from cases_fakes import NOW, Interaction, core, member
 from test_staff_actions import _action_bot
@@ -35,10 +36,15 @@ async def badge_core(*, rows=None, enabled=True, **settings):
     action_bot, mutations, bus, _ = _action_bot()
     mutations["players"].docs = [player_row()] if rows is None else rows
     action_bot.store.now_utc = lambda: NOW
-    service.players = Players(action_bot, mutations)
-    service.notifier.find_player = service.players.find_player_by_uuid
+    service.player_store = Players(action_bot, mutations)
+    service.punishments = action_bot.container.punishments
+    service.notifier.find_player = service.player_store.find_player_by_uuid
     bot.store = action_bot.store
     bot.bus = action_bot.bus
+    for family in FAMILY_BUSES:
+        setattr(bot.container, family, getattr(action_bot.container, family))
+    bot.container.punishments = action_bot.container.punishments
+    bot.container.audit = action_bot.container.audit
     bot.resolve_channel = action_bot.resolve_channel
 
     mirror_audits(bot, action_bot, database, mutations)

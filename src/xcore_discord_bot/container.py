@@ -3,6 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from .account_merge_store import AccountMergeStore
+from .audit_store import AuditStore
+from .bus.accounts import AccountsBus
+from .bus.cases import CasesBus
+from .bus.chat import ChatBus
+from .bus.maps import MapsBus
+from .bus.moderation import ModerationBus
+from .bus.rating import RatingBus
+from .bus.security import SecurityBus
+from .bus.sentinel import SentinelBus
+from .bus.transport import RedisTransport
 from .cases import flows  # noqa: F401 -- importing modules registers flow definitions
 from .cases.notify import CaseNotifier
 from .cases.panel import CasePanel
@@ -18,8 +29,9 @@ from .daemons.staff_sync_daemon import StaffSyncDaemon
 from .daemons.stream_supervisor import StreamSupervisor
 from .game_stats import GameStatsStore
 from .mongo_store import MongoStore
+from .punishment_store import PunishmentStore
 from .rating_store import RatingStore
-from .redis_bus import RedisBus
+from .registry import LiveServerRegistry
 from .rpc.mindustry_rpc import MindustryRpcClient
 from .services.player_service import PlayerService
 from .services.rating_service import RatingService
@@ -31,11 +43,23 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class ServiceContainer:
+    """The services built on the bot's store and bus; the bot owns those two itself."""
+
     settings: Settings
-    store: MongoStore
-    bus: RedisBus
+    accounts_bus: AccountsBus
+    cases_bus: CasesBus
+    chat_bus: ChatBus
+    maps_bus: MapsBus
+    moderation_bus: ModerationBus
+    rating_bus: RatingBus
+    security_bus: SecurityBus
+    sentinel_bus: SentinelBus
     rpc: MindustryRpcClient
+    # The live game servers, as their heartbeats report them.
+    servers: LiveServerRegistry
     players: PlayerService
+    punishments: PunishmentStore
+    audit: AuditStore
     ratings: RatingStore
     game_stats: GameStatsStore
     rating_service: RatingService
@@ -43,10 +67,11 @@ class ServiceContainer:
     admin_sync_daemon: AdminSyncDaemon
     rating_merge_daemon: RatingMergeDaemon
     stream_supervisor: StreamSupervisor
+    cases: CaseService
+    case_panel: CasePanel
+    cases_reconcile_daemon: CasesReconcileDaemon
+    # Only roles mode syncs game roles; legacy mode reconciles admins instead.
     staff_sync_daemon: StaffSyncDaemon | None = None
-    cases: CaseService | None = None
-    case_panel: CasePanel | None = None
-    cases_reconcile_daemon: CasesReconcileDaemon | None = None
 
     @classmethod
     def create(
@@ -54,24 +79,46 @@ class ServiceContainer:
         settings: Settings,
         bot: XCoreDiscordBot,
         *,
-        store: MongoStore | None = None,
-        bus: RedisBus | None = None,
+        store: MongoStore,
+        bus: RedisTransport,
     ) -> ServiceContainer:
-        bus = bus if bus is not None else RedisBus(settings)
-        store = store if store is not None else MongoStore(settings)
-        rpc = MindustryRpcClient(bus)
+        servers = LiveServerRegistry()
+        accounts_bus = AccountsBus(bus, servers)
+        cases_bus = CasesBus(bus)
+        chat_bus = ChatBus(bus, servers)
+        maps_bus = MapsBus(bus)
+        moderation_bus = ModerationBus(bus, servers)
+        rating_bus = RatingBus(bus)
+        security_bus = SecurityBus(bus)
+        sentinel_bus = SentinelBus(bus)
+        rpc = MindustryRpcClient(
+            cases=cases_bus,
+            maps=maps_bus,
+            rating=rating_bus,
+            security=security_bus,
+            sentinel=sentinel_bus,
+            servers=servers,
+        )
 
+        punishments = PunishmentStore(store)
+        audit = AuditStore(store)
         ratings = RatingStore(store)
         rating_service = RatingService(
             store=ratings, rpc=rpc, timeout_ms=settings.rpc_timeout_ms
         )
         players = PlayerService(
-            store=store, bus=bus, ratings=rating_service, settings=settings, rpc=rpc
+            store=store,
+            ratings=rating_service,
+            settings=settings,
+            rpc=rpc,
+            accounts=accounts_bus,
+            moderation=moderation_bus,
+            merges=AccountMergeStore(store, punishments, audit, settings),
         )
 
         presence_daemon = PresenceDaemon(bot=bot)
         admin_sync_daemon = AdminSyncDaemon(
-            bot=bot, store=store, bus=bus, settings=settings
+            bot=bot, store=store, accounts=accounts_bus, settings=settings
         )
         rating_merge_daemon = RatingMergeDaemon(bot=bot, ratings=rating_service)
         stream_supervisor = StreamSupervisor(bot=bot)
@@ -84,16 +131,26 @@ class ServiceContainer:
             threads=CaseThreads(bot, settings),
             notifier=CaseNotifier(bot, settings, find_player=store.find_player_by_uuid),
             claims=bus,
-            players=store,
+            player_store=store,
+            punishments=punishments,
         )
         case_panel = CasePanel(cases, bot)
 
         return cls(
             settings=settings,
-            store=store,
-            bus=bus,
+            accounts_bus=accounts_bus,
+            cases_bus=cases_bus,
+            chat_bus=chat_bus,
+            maps_bus=maps_bus,
+            moderation_bus=moderation_bus,
+            rating_bus=rating_bus,
+            security_bus=security_bus,
+            sentinel_bus=sentinel_bus,
             rpc=rpc,
+            servers=servers,
             players=players,
+            punishments=punishments,
+            audit=audit,
             ratings=ratings,
             game_stats=GameStatsStore(store),
             rating_service=rating_service,

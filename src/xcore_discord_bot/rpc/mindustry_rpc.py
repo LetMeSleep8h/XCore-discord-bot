@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar
+from typing import TypeVar
 
 from xcore_protocol.generated.cases import CasesEvidenceResponseV1
 from xcore_protocol.generated.maps import MapsInspectResponseV1, MapsUploadResponseV1
@@ -20,11 +20,21 @@ from xcore_protocol.generated.security import (
     SecurityStaffSyncRequestV1,
     SecurityStaffSyncResponseV1,
 )
+from xcore_protocol.generated.sentinel import (
+    SentinelSubnetRulesCheckResponseV1,
+    SentinelSubnetRulesListResponseV1,
+    SentinelSubnetRulesResponseV1,
+)
 from xcore_protocol.generated.shared import SeasonPrizeV1
 
-from ..redis_bus import RedisBus, RpcFailed
-from ..registry import server_registry
-from ..retry import TRANSIENT_EXCEPTIONS
+from ..bus.cases import CasesBus
+from ..bus.maps import MapsBus
+from ..bus.rating import RatingBus
+from ..bus.security import SecurityBus
+from ..bus.sentinel import SentinelBus
+from ..bus.transport import RpcFailed
+from ..registry import LiveServerRegistry
+from ..retry import TRANSIENT_EXCEPTIONS, retry_read_rpc
 
 T = TypeVar("T")
 
@@ -38,8 +48,24 @@ class NoLiveServerError(RuntimeError):
 
 
 class MindustryRpcClient:
-    def __init__(self, bus: RedisBus) -> None:
-        self._bus = bus
+    """Which server answers, retries and request ids, over the per-family buses."""
+
+    def __init__(
+        self,
+        *,
+        cases: CasesBus,
+        maps: MapsBus,
+        rating: RatingBus,
+        security: SecurityBus,
+        sentinel: SentinelBus,
+        servers: LiveServerRegistry,
+    ) -> None:
+        self._cases = cases
+        self._maps = maps
+        self._rating = rating
+        self._security = security
+        self._sentinel = sentinel
+        self._servers = servers
 
     async def _retry_staff(self, call: Callable[[], Awaitable[T]]) -> T:
         for attempt in range(2):
@@ -72,7 +98,7 @@ class MindustryRpcClient:
             complete=True,
         )
         return await self._retry_staff(
-            lambda: self._bus.rpc_staff_sync(request, timeout_ms=timeout_ms)
+            lambda: self._security.rpc_staff_sync(request, timeout_ms=timeout_ms)
         )
 
     async def reset_staff_password(
@@ -88,7 +114,9 @@ class MindustryRpcClient:
             playerUuid=player_uuid,
         )
         return await self._retry_staff(
-            lambda: self._bus.rpc_staff_reset_password(request, timeout_ms=timeout_ms)
+            lambda: self._security.rpc_staff_reset_password(
+                request, timeout_ms=timeout_ms
+            )
         )
 
     async def on_any_live_server(self, call: Callable[[str], Awaitable[T]]) -> T:
@@ -104,7 +132,7 @@ class MindustryRpcClient:
         which makes every server but the first refuse it.
         """
         names = sorted(
-            (server.name for server in server_registry.get_all_servers()),
+            (server.name for server in self._servers.get_all_servers()),
             key=str.lower,
         )[:MAX_SERVERS_TRIED]
         if not names:
@@ -139,7 +167,7 @@ class MindustryRpcClient:
     ) -> RatingSeasonRescheduleResponseV1:
         request_id = self._request_id()
         return await self.on_any_live_server(
-            lambda server: self._bus.rpc_season_reschedule(
+            lambda server: self._rating.rpc_season_reschedule(
                 server=server,
                 ladder=ladder,
                 operation=operation,
@@ -164,7 +192,7 @@ class MindustryRpcClient:
     ) -> RatingSeasonPrizesSetResponseV1:
         request_id = self._request_id()
         return await self.on_any_live_server(
-            lambda server: self._bus.rpc_season_prize_add(
+            lambda server: self._rating.rpc_season_prize_add(
                 server=server,
                 ladder=ladder,
                 prize=prize,
@@ -187,7 +215,7 @@ class MindustryRpcClient:
     ) -> RatingSeasonPrizesSetResponseV1:
         request_id = self._request_id()
         return await self.on_any_live_server(
-            lambda server: self._bus.rpc_season_prize_remove(
+            lambda server: self._rating.rpc_season_prize_remove(
                 server=server,
                 ladder=ladder,
                 place_from=place_from,
@@ -212,7 +240,7 @@ class MindustryRpcClient:
         player_pid: int | None = None,
     ) -> RatingPrizeGrantUpdateResponseV1:
         return await self.on_any_live_server(
-            lambda server: self._bus.rpc_prize_delivered(
+            lambda server: self._rating.rpc_prize_delivered(
                 server=server,
                 ladder=ladder,
                 season=season,
@@ -233,7 +261,7 @@ class MindustryRpcClient:
         timeout_ms: int,
     ) -> RatingAccountsMergeResponseV1:
         return await self.on_any_live_server(
-            lambda server: self._bus.rpc_ratings_merge(
+            lambda server: self._rating.rpc_ratings_merge(
                 server=server,
                 source_uuid=source_uuid,
                 target_uuid=target_uuid,
@@ -251,7 +279,7 @@ class MindustryRpcClient:
     ) -> CasesEvidenceResponseV1:
         # Evidence belongs to this server's recent chat/history; another server
         # cannot answer for it. An offline target is a valid typed response.
-        return await self._bus.rpc_case_evidence(
+        return await self._cases.rpc_case_evidence(
             server=server,
             player_uuid=player_uuid,
             chat_lines=chat_lines,
@@ -267,7 +295,7 @@ class MindustryRpcClient:
         server: str | None = None,
     ) -> MapsInspectResponseV1:
         async def inspect(name: str) -> MapsInspectResponseV1:
-            return await self._bus.rpc_inspect_map(
+            return await self._maps.rpc_inspect_map(
                 server=name, url=url, file_name=file_name, profile=profile
             )
 
@@ -275,49 +303,61 @@ class MindustryRpcClient:
             return await inspect(server)
         return await self.on_any_live_server(inspect)
 
-    async def rpc_subnet_rules_command(self, **kwargs: Any) -> Any:
-        return await self._bus.rpc_subnet_rules_command(**kwargs)
+    # Reads are retried on a transient failure; writes are not, since a write that timed
+    # out may still have been applied.
 
-    async def rpc_subnet_rules_list(self, target_server: str, timeout_ms: int) -> Any:
-        return await self._bus.rpc_subnet_rules_list(target_server, timeout_ms)
-
-    async def rpc_subnet_rules_check(
-        self, target_server: str, ip: str, timeout_ms: int
-    ) -> Any:
-        return await self._bus.rpc_subnet_rules_check(target_server, ip, timeout_ms)
-
-    async def rpc_maps_list(
-        self, *, server: str, timeout_ms: int
-    ) -> list[dict[str, str]]:
-        return await self._bus.rpc_maps_list(server=server, timeout_ms=timeout_ms)
-
-    async def claim_idempotency(self, key: str, *, ttl_seconds: int = 600) -> bool:
-        return await self._bus.claim_idempotency(key, ttl_seconds=ttl_seconds)
-
-    async def rpc_remove_map(
-        self,
-        *,
-        server: str,
-        file_name: str,
-        timeout_ms: int,
-    ) -> str:
-        return await self._bus.rpc_remove_map(
-            server=server,
-            file_name=file_name,
-            timeout_ms=timeout_ms,
+    async def list_maps(self, *, server: str, timeout_ms: int) -> list[dict[str, str]]:
+        return await retry_read_rpc(
+            lambda: self._maps.rpc_maps_list(server=server, timeout_ms=timeout_ms)
         )
 
-    async def rpc_upload_maps(
+    async def remove_map(self, *, server: str, file_name: str, timeout_ms: int) -> str:
+        return await self._maps.rpc_remove_map(
+            server=server, file_name=file_name, timeout_ms=timeout_ms
+        )
+
+    async def upload_maps(
         self, *, server: str, files: list[dict[str, object]], timeout_ms: int
     ) -> MapsUploadResponseV1:
-        return await self._bus.rpc_upload_maps(
+        return await self._maps.rpc_upload_maps(
             server=server, files=files, timeout_ms=timeout_ms
         )
 
-    async def publish_maps_load(
+    async def subnet_rules_command(
         self,
         *,
-        server: str,
-        files: list[dict[str, object]],
-    ) -> None:
-        await self._bus.publish_maps_load(server=server, files=files)
+        operation: str,
+        rules: list[str] | tuple[str, ...],
+        discord_id: str,
+        target_server: str,
+        source: str | None = None,
+        reason: str | None = None,
+        discord_username: str | None = None,
+        expires_at: int | None = None,
+        timeout_ms: int,
+    ) -> SentinelSubnetRulesResponseV1:
+        return await self._sentinel.rpc_subnet_rules_command(
+            operation=operation,
+            rules=rules,
+            discord_id=discord_id,
+            target_server=target_server,
+            source=source,
+            reason=reason,
+            discord_username=discord_username,
+            expires_at=expires_at,
+            timeout_ms=timeout_ms,
+        )
+
+    async def subnet_rules_list(
+        self, *, server: str, timeout_ms: int
+    ) -> SentinelSubnetRulesListResponseV1:
+        return await retry_read_rpc(
+            lambda: self._sentinel.rpc_subnet_rules_list(server, timeout_ms)
+        )
+
+    async def subnet_rules_check(
+        self, *, server: str, ip: str, timeout_ms: int
+    ) -> SentinelSubnetRulesCheckResponseV1:
+        return await retry_read_rpc(
+            lambda: self._sentinel.rpc_subnet_rules_check(server, ip, timeout_ms)
+        )

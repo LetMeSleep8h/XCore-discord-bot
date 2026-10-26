@@ -15,6 +15,9 @@ from xcore_protocol.generated.shared import ActorRefV1, PlayerRefV1
 
 from xcore_discord_bot import runtime_consumers
 from xcore_discord_bot.bot import XCoreDiscordBot
+from xcore_discord_bot.bus.cases import parse_case_report_payload
+from xcore_discord_bot.bus.moderation import ModerationBus
+from xcore_discord_bot.bus.transport import RedisTransport
 from xcore_discord_bot.cases.model import CaseKind
 from xcore_discord_bot.cases.notify import Outcome
 from xcore_discord_bot.cases.redis_transport import RedisCaseTransport
@@ -22,7 +25,7 @@ from xcore_discord_bot.cases.registry import Flow, FlowRegistry
 from xcore_discord_bot.cases.transport import NoCaseTransport
 from xcore_discord_bot.daemons.stream_supervisor import StreamSupervisor
 from xcore_discord_bot.player_pids import NO_PID
-from xcore_discord_bot.redis_bus import RedisBus, parse_case_report_payload
+from xcore_discord_bot.registry import LiveServerRegistry
 from xcore_discord_bot.settings import Settings
 
 
@@ -134,7 +137,7 @@ async def test_report_hook_failure_propagates_to_stream_handler(monkeypatch):
 
 async def test_report_runtime_waits_for_startup_before_creating_group(monkeypatch):
     redis = FakeRedis(decode_responses=True)
-    bus = RedisBus(
+    bus = RedisTransport(
         SimpleNamespace(redis_group_prefix="xcore:cg", redis_consumer_name="bot")
     )
     bus._redis = redis
@@ -147,10 +150,10 @@ async def test_report_runtime_waits_for_startup_before_creating_group(monkeypatc
     try:
         await asyncio.sleep(0)
         assert await redis.keys("*") == []
-        bus.consume_case_reports = AsyncMock()
+        consume = bot.container.cases_bus.consume_case_reports = AsyncMock()
         ready.set()
         await task
-        bus.consume_case_reports.assert_awaited_once()
+        consume.assert_awaited_once()
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -211,7 +214,8 @@ async def test_bot_installs_adapter_after_container_creation_and_wires_notifier(
     from cases_fakes import core
 
     cases, _, _ = await core(flow=DUMMY_FLOW)
-    container = SimpleNamespace(cases=cases, rpc=MagicMock())
+    cases_bus = MagicMock()
+    container = SimpleNamespace(cases=cases, cases_bus=cases_bus, rpc=MagicMock())
     factory = MagicMock(return_value=container)
     monkeypatch.setattr("xcore_discord_bot.bot.ServiceContainer.create", factory)
     settings = Settings(
@@ -230,17 +234,18 @@ async def test_bot_installs_adapter_after_container_creation_and_wires_notifier(
     if enabled:
         from test_cases_service import opened
 
-        bus.publish_case_notice = AsyncMock()
+        cases_bus.publish_case_notice = AsyncMock()
         case = await opened(cases)
         await cases.notifier.send(
             cases, case, Outcome(case.opener, "report_resolved", "cases-outcome")
         )
-        bus.publish_case_notice.assert_awaited_once_with(
+        cases_bus.publish_case_notice.assert_awaited_once_with(
             notice_id=f"{case.number}:opener-secret:report_resolved",
             player_uuid="opener-secret",
             server="server",
         )
-        assert cases.transport._bus is bus and cases.transport._rpc is container.rpc
+        assert cases.transport._cases is cases_bus
+        assert cases.transport._rpc is container.rpc
     # Close the base bot only; fake container daemons do not own running tasks.
     await discord.ext.commands.Bot.close(bot)
 
@@ -271,7 +276,7 @@ async def test_ban_consumer_old_and_new_signed_pid_and_ban_number(
 
     lookup = AsyncMock(return_value=SimpleNamespace(pid=-7))
     bot = make_bot(settings=make_settings(discord_bans_channel_id=777))
-    bot.bus.consume_bans = consume
+    bot.container.moderation_bus.consume_bans = consume
     bot.store.find_player_by_uuid = lookup
     bot.store.now_utc = lambda: datetime(2026, 10, 13, tzinfo=UTC)
     await runtime_consumers.consume_bans(bot)
@@ -298,7 +303,7 @@ async def test_ban_cases_dispatch_works_without_log_channel_and_propagates_error
         await callback(event)
 
     bot = bot_for(cases)
-    bot.bus.consume_bans = consume
+    bot.container.moderation_bus.consume_bans = consume
     monkeypatch.setattr(runtime_consumers, "run_consumer_forever", once)
     log = AsyncMock()
     monkeypatch.setattr(runtime_consumers, "post_ban_log", log)
@@ -312,7 +317,7 @@ async def test_direct_bans_without_stream_identity_do_not_share_log_checkpoint(
     monkeypatch,
 ):
     redis = FakeRedis(decode_responses=True)
-    bus = RedisBus(
+    bus = RedisTransport(
         SimpleNamespace(redis_group_prefix="xcore:cg", redis_consumer_name="bot")
     )
     bus._redis = redis
@@ -335,7 +340,7 @@ async def test_direct_bans_without_stream_identity_do_not_share_log_checkpoint(
         await callback(event)
         await callback(event)
 
-    bot.bus.consume_bans = consume
+    bot.container.moderation_bus.consume_bans = consume
     try:
         await runtime_consumers.consume_bans(bot)
         assert log.await_count == 3 and hook.await_count == 3
@@ -346,17 +351,23 @@ async def test_direct_bans_without_stream_identity_do_not_share_log_checkpoint(
 
 async def test_failed_direct_ban_log_remains_retryable_without_checkpoint():
     redis = FakeRedis(decode_responses=True)
-    bus = RedisBus(
+    bus = RedisTransport(
         SimpleNamespace(redis_group_prefix="xcore:cg", redis_consumer_name="bot")
     )
     bus._redis = redis
     callback = AsyncMock(side_effect=[RuntimeError("Discord failed"), None, None])
     try:
         with pytest.raises(RuntimeError, match="Discord failed"):
-            await bus.run_ban_log_once(ban_event(0, 57), callback)
+            await ModerationBus(bus, LiveServerRegistry()).run_ban_log_once(
+                ban_event(0, 57), callback
+            )
         assert await redis.keys("xcore:idmp:ban-event-log:*") == []
-        await bus.run_ban_log_once(ban_event(0, 57), callback)
-        await bus.run_ban_log_once(ban_event(0, 57), callback)
+        await ModerationBus(bus, LiveServerRegistry()).run_ban_log_once(
+            ban_event(0, 57), callback
+        )
+        await ModerationBus(bus, LiveServerRegistry()).run_ban_log_once(
+            ban_event(0, 57), callback
+        )
         assert callback.await_count == 3
         assert await redis.keys("xcore:idmp:ban-event-log:*") == []
     finally:
@@ -376,7 +387,7 @@ async def test_received_ban_log_embed_preserves_old_fixture_and_shows_new_number
         await callback(event)
 
     bot = make_bot(settings=make_settings(discord_bans_channel_id=777))
-    bot.bus.consume_bans = consume
+    bot.container.moderation_bus.consume_bans = consume
     bot.store.find_player_by_uuid = AsyncMock(return_value=None)
     bot.store.now_utc = lambda: datetime(2026, 10, 13, tzinfo=UTC)
     bot.resolve_channel = AsyncMock(return_value=channel)
@@ -398,7 +409,7 @@ async def test_constructor_installs_transport_for_notifier(monkeypatch):
     from cases_fakes import core
 
     cases, _, _ = await core(flow=DUMMY_FLOW)
-    container = SimpleNamespace(cases=cases, rpc=MagicMock())
+    container = SimpleNamespace(cases=cases, cases_bus=MagicMock(), rpc=MagicMock())
     monkeypatch.setattr(
         "xcore_discord_bot.bot.ServiceContainer.create", lambda *a, **kw: container
     )
@@ -407,12 +418,12 @@ async def test_constructor_installs_transport_for_notifier(monkeypatch):
     assert isinstance(cases.transport, RedisCaseTransport)
     from test_cases_service import opened
 
-    bot.bus.publish_case_notice = AsyncMock()
+    container.cases_bus.publish_case_notice = AsyncMock()
     case = await opened(cases)
     await cases.notifier.send(
         cases, case, Outcome(case.opener, "report_resolved", "cases-outcome")
     )
-    bot.bus.publish_case_notice.assert_awaited_once_with(
+    container.cases_bus.publish_case_notice.assert_awaited_once_with(
         notice_id=f"{case.number}:opener-secret:report_resolved",
         player_uuid="opener-secret",
         server="server",

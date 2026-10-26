@@ -6,6 +6,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from bot_fakes import FAMILY_BUSES
 from cases_action_fakes import Claims, mirror_audits
 from cases_action_fakes import Players as SharedPlayers
 from cases_fakes import NOW, Interaction, member
@@ -119,14 +120,19 @@ async def reports_core(*, enabled=True, guild=None, **settings):
     database_bans = mutations["bans"]
     db.collections["bans"] = database_bans
     db.collections["mutes"] = mutations["mutes"]
-    service.players = Players(action_bot, mutations)
-    service.notifier.find_player = service.players.find_player_by_uuid
+    service.player_store = Players(action_bot, mutations)
+    service.punishments = action_bot.container.punishments
+    service.notifier.find_player = service.player_store.find_player_by_uuid
     service.claims = Claims()
     bot.settings = service.settings.model_copy(
         update={"discord_bans_channel_id": 10, "discord_mutes_channel_id": 20}
     )
     bot.store = action_bot.store
     bot.bus = action_bot.bus
+    for family in FAMILY_BUSES:
+        setattr(bot.container, family, getattr(action_bot.container, family))
+    bot.container.punishments = action_bot.container.punishments
+    bot.container.audit = action_bot.container.audit
     bot.resolve_channel = action_bot.resolve_channel
 
     mirror_audits(bot, action_bot, db, mutations)
@@ -240,7 +246,7 @@ async def sanction(service, case, verb="ban", *, pid="-5", duration="1d", user=N
 
 def player(service, uuid):
     return next(
-        r for r in service.players.database["players"].docs if r["uuid"] == uuid
+        r for r in service.player_store.database["players"].docs if r["uuid"] == uuid
     )
 
 

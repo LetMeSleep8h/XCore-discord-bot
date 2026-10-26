@@ -69,7 +69,9 @@ Optional:
 - `PERMISSIONS_MODE` (`legacy` by default, or `roles`)
 - `PERMISSIONS_CONFIG_PATH` (required in `roles`; path to the shared `permissions.toml`)
 - `PERMISSIONS_RPC_SERVER` (required in `roles`; exact name of the server answering security RPCs)
-- `MONGO_URI` (default: `mongodb://127.0.0.1:27017`)
+- `MONGO_URI` (default: `mongodb://127.0.0.1:27017`). Account merges write in one transaction, so
+  they need a replica set (`...?replicaSet=rs0`); against a standalone server a merge is refused
+  and nothing is changed
 - `MONGO_DB_NAME` (default: `xcore`)
 
 ## Permission roles rollout
@@ -154,8 +156,19 @@ See `docs/canary-rollout.md`.
 ## Lint
 
 ```bash
-uvx ruff check
-uvx ruff format --check
+uv run ruff check
+uv run ruff format --check
+```
+
+## Type check
+
+`mypy` runs in CI against `mypy-baseline.txt`, the errors that existed when it was added.
+A new error fails the build, and so does a fixed one that is still in the baseline:
+
+```bash
+uv run mypy | uv run mypy-baseline filter
+# after fixing errors, shrink the baseline and commit it
+uv run mypy | uv run mypy-baseline sync
 ```
 
 ## Cases

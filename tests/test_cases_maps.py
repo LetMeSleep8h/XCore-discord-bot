@@ -32,17 +32,9 @@ from xcore_discord_bot.cases.reconcile import reconcile_cases
 from xcore_discord_bot.cases.startup import initialize_flows
 from xcore_discord_bot.cogs.maps import MapsCog
 from xcore_discord_bot.i18n import t
+from xcore_discord_bot.registry import LiveServerRegistry
 from xcore_discord_bot.rpc.mindustry_rpc import NoLiveServerError
 from xcore_discord_bot.staff_actions import MapUploadFailed
-
-
-@pytest.fixture(autouse=True)
-def servers(monkeypatch):
-    registry = SimpleNamespace(
-        get_all_servers=lambda: [SimpleNamespace(name="mini-pvp", mode="pvp")]
-    )
-    monkeypatch.setattr(maps, "server_registry", registry)
-    return registry
 
 
 async def opened(**settings):
@@ -365,13 +357,15 @@ async def test_error_findings_require_explicit_accept_anyway_and_server_severity
     )
 
 
-async def test_server_selection_prioritizes_matching_profile_and_caps_25(servers):
+async def test_server_selection_prioritizes_matching_profile_and_caps_25():
     env, case = await opened()
     service, _, bot, _, bus, _, _, _, _, _ = env
-    servers.get_all_servers = lambda: (
-        [SimpleNamespace(name=f"server-{i}", mode="attack") for i in range(30)]
-        + [SimpleNamespace(name="matching", mode="pvp")]
-    )
+    bot.container.servers = LiveServerRegistry()
+    for i in range(30):
+        bot.container.servers.update_server(
+            f"server-{i}", i, 0, 20, "v1", mode="attack"
+        )
+    bot.container.servers.update_server("matching", 99, 0, 20, "v1", mode="pvp")
     interaction = Interaction(bot, user=reviewer())
     await service.dispatch_action(
         case.number, "accept", reviewer(), "en", interaction=interaction
@@ -486,8 +480,8 @@ async def test_crash_after_upload_before_case_close_recovers_from_audit_without_
 ):
     env, case = await opened()
     service, _, _, _, bus, _, _, _, _, _ = env
-    original = service._finish_action
-    service._finish_action = AsyncMock(
+    original = service.actions._finish
+    service.actions._finish = AsyncMock(
         side_effect=RuntimeError("crash before case write")
     )
     with pytest.raises(RuntimeError, match="crash"):
@@ -495,7 +489,7 @@ async def test_crash_after_upload_before_case_close_recovers_from_audit_without_
     current = await service.get(case.number)
     assert current.pending_action and current.actionable
     assert current.payload["upload_attempt"]["state"] == "installed"
-    service._finish_action = original
+    service.actions._finish = original
     await reconcile_cases(service)
     final = await service.get(case.number)
     assert (
@@ -508,13 +502,13 @@ async def test_crash_after_upload_before_case_close_recovers_from_audit_without_
 async def test_audit_write_response_failure_after_persisted_completion_recovers_without_second_upload():
     env, case = await opened()
     service, _, bot, _, bus, _, _, _, _, _ = env
-    original = bot.store.append_moderation_audit
+    original = bot.container.audit.append_moderation_audit
 
     async def failing(**kw):
         await original(**kw)
         raise RuntimeError("audit reply lost")
 
-    bot.store.append_moderation_audit = failing
+    bot.container.audit.append_moderation_audit = failing
     final = await do_accept(service, case)
     assert final.resolution.code == "accepted" and len(bus.upload_calls) == 1
 

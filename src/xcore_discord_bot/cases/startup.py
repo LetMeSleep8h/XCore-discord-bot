@@ -44,7 +44,7 @@ async def initialize_flows(service) -> None:
             continue
         try:
             reasons = await validate_flow(service, kind)
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 -- a flow that cannot be checked is disabled, not fatal
             log_failure(logger, kind, "Cases startup check failed for %s", kind)
             reasons = [f"Discord setup could not be checked ({type(error).__name__})"]
         if reasons:
@@ -56,7 +56,7 @@ async def initialize_flows(service) -> None:
             service.registry.enable(kind)
 
 
-async def validate_flow(service, kind: CaseKind) -> list[str]:
+async def validate_flow(service, kind: CaseKind) -> list[str]:  # noqa: C901
     settings, threads = service.settings, service.threads
     reasons: list[str] = []
     forum_key = (

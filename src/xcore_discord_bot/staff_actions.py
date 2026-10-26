@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -11,10 +11,10 @@ from xcore_protocol.generated.maps import MapsUploadResponseV1
 from xcore_protocol.generated.shared import MapUploadResultV1
 
 from .badges import get_badge
+from .bus.transport import RpcError
 from .dto import Actor, BanRecord, PlayerRecord, record_identifiers
 from .moderation_logs import post_ban_log, post_mute_log
 from .protocol_outbound import build_maps_upload_request
-from .redis_bus import RpcError
 from .retry import TRANSIENT_EXCEPTIONS
 
 if TYPE_CHECKING:
@@ -147,7 +147,7 @@ async def _append_audit(
     extra: dict[str, str] | None = None,
 ) -> str:
     uuid_value, ip_value = record_identifiers(player)
-    return await bot.store.append_moderation_audit(
+    return await bot.container.audit.append_moderation_audit(
         action=action,
         target_uuid=uuid_value or "",
         target_pid=player.pid,
@@ -195,7 +195,7 @@ async def perform_ban(
         raise ActionAlreadyProcessed("This ban was already processed recently.")
 
     expire = bot.store.now_utc() + duration
-    ban_id = await bot.store.next_ban_id()
+    ban_id = await bot.container.punishments.next_ban_id()
     ban = BanRecord(
         uuid=uuid_value or "",
         ip=ip_value,
@@ -208,7 +208,7 @@ async def perform_ban(
         ban_id=ban_id,
         case_number=case_number,
     )
-    await bot.store.upsert_ban(
+    await bot.container.punishments.upsert_ban(
         uuid=uuid_value or "",
         ip=ip_value,
         pid=player.pid,
@@ -233,7 +233,9 @@ async def perform_ban(
             ban_id=ban_id, case_number=case_number, case_action_token=case_action_token
         ),
     )
-    await bot.bus.publish_kick_banned(uuid_value=uuid_value or "", ip=ip_value)
+    await bot.container.moderation_bus.publish_kick_banned(
+        uuid_value=uuid_value or "", ip=ip_value
+    )
     await post_ban_log(
         bot,
         pid=player.pid,
@@ -260,6 +262,11 @@ async def perform_ban(
     )
 
 
+# Awaited with the ban right before it is deleted or its expiry changes; raising stops
+# the write. Lets a caller such as an appeal confirm the ban is still the one it acts on.
+BanCheck = Callable[[BanRecord], Awaitable[None]]
+
+
 async def perform_unban(
     bot: XCoreDiscordBot,
     ban: BanRecord,
@@ -269,6 +276,7 @@ async def perform_unban(
     player: PlayerRecord | None = None,
     request_id: str | None = None,
     case_action_token: str | None = None,
+    check: BanCheck | None = None,
 ) -> BanResult:
     uuid_value = str(ban.uuid or "").strip() or None
     ip_value = str(ban.ip or "").strip() or None
@@ -277,12 +285,16 @@ async def perform_unban(
             "Cannot unban player: both UUID and IP are missing in player data."
         )
     if ban.ban_id is None:
-        assigned = await bot.store.ensure_ban_id(uuid=uuid_value or "", ip=ip_value)
+        assigned = await bot.container.punishments.ensure_ban_id(
+            uuid=uuid_value or "", ip=ip_value
+        )
         if assigned is None:
             raise BanNotFound("No active ban found")
         ban = assigned
+    if check is not None:
+        await check(ban)
     if (
-        await bot.store.delete_ban(
+        await bot.container.punishments.delete_ban(
             uuid=uuid_value or "", ip=ip_value, ban_id=ban.ban_id
         )
         <= 0
@@ -303,7 +315,7 @@ async def perform_unban(
         ),
     )
     if uuid_value is not None:
-        await bot.bus.publish_pardon_player(uuid_value=uuid_value)
+        await bot.container.moderation_bus.publish_pardon_player(uuid_value=uuid_value)
     return BanResult(ban, audit_id, f"Unbanned `{_subject_name(subject)}`")
 
 
@@ -316,8 +328,9 @@ async def perform_shorten_ban(
     *,
     request_id: str | None = None,
     case_action_token: str | None = None,
+    check: BanCheck | None = None,
 ) -> BanResult:
-    ban = await bot.store.find_ban_by_id(ban_id)
+    ban = await bot.container.punishments.find_ban_by_id(ban_id)
     if ban is None:
         raise BanNotFound("No active ban found")
     if not isinstance(new_expiry, datetime):
@@ -331,7 +344,11 @@ async def perform_shorten_ban(
     now = now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
     if expire <= now:
         raise InvalidBanExpiry("The new expiry must be in the future.")
-    if not await bot.store.update_ban_expiry(ban_id=ban_id, new_expiry=expire):
+    if check is not None:
+        await check(ban)
+    if not await bot.container.punishments.update_ban_expiry(
+        ban_id=ban_id, new_expiry=expire
+    ):
         raise InvalidBanExpiry(
             "The new expiry must be earlier than the current ban expiry."
         )
@@ -393,7 +410,7 @@ async def perform_mute(
     _require_duration(duration)
     expire = bot.store.now_utc() + duration
     player_name = player.nickname
-    await bot.store.upsert_mute(
+    await bot.container.punishments.upsert_mute(
         uuid=uuid_value,
         pid=player.pid,
         name=player_name,
@@ -491,7 +508,7 @@ async def perform_badge_grant(
     if changed:
         updated_player = await bot.store.find_player_by_uuid(uuid_value)
         if updated_player is not None:
-            await bot.bus.publish_player_badge_inventory_changed(
+            await bot.container.accounts_bus.publish_player_badge_inventory_changed(
                 uuid_value=uuid_value,
                 active_badge=updated_player.active_badge,
                 unlocked_badges=updated_player.unlocked_badges,
@@ -562,7 +579,7 @@ async def perform_map_upload(
         raise InvalidMapUpload("A map case must upload exactly one .msav file.")
     bot.map_cache.pop(server, None)
     try:
-        response = await bot.bus.rpc_upload_maps(
+        response = await bot.container.rpc.upload_maps(
             server=server, files=payload, timeout_ms=120_000
         )
         if not isinstance(response, MapsUploadResponseV1):
@@ -612,7 +629,7 @@ async def _append_map_upload_audit(
     *,
     request_id: str | None,
 ) -> str:
-    return await bot.store.append_moderation_audit(
+    return await bot.container.audit.append_moderation_audit(
         action="NOTE",
         target_uuid="",
         target_pid=None,

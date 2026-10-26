@@ -14,12 +14,13 @@ from xcore_protocol.generated.sentinel import (
 )
 from xcore_protocol.generated.shared import ActorRefV1ActorType
 
+from xcore_discord_bot.bus.sentinel import SentinelBus
+from xcore_discord_bot.bus.transport import RedisTransport
 from xcore_discord_bot.protocol_outbound import (
     build_sentinel_subnet_rules_check_request,
     build_sentinel_subnet_rules_command,
     build_sentinel_subnet_rules_list_request,
 )
-from xcore_discord_bot.redis_bus import RedisBus
 
 
 def _settings() -> SimpleNamespace:
@@ -71,7 +72,7 @@ def test_subnet_request_builders_round_trip(builder, model, expected) -> None:
 
 @pytest.mark.asyncio
 async def test_subnet_rpc_methods_parse_typed_responses() -> None:
-    bus = RedisBus(_settings())
+    bus = RedisTransport(_settings())
     responses = {
         SentinelSubnetRulesCommandV1.MESSAGE_TYPE: SentinelSubnetRulesResponseV1(
             request="req", success=True, targetServer="s"
@@ -90,16 +91,17 @@ async def test_subnet_rpc_methods_parse_typed_responses() -> None:
         assert payload["messageVersion"] == 1
         return {"payload_json": json.dumps(responses[rpc_type].to_payload())}
 
-    bus._rpc_request = MethodType(fake_rpc_request, bus)
-    command = await bus.rpc_subnet_rules_command(
+    bus.rpc_request = MethodType(fake_rpc_request, bus)
+    sentinel = SentinelBus(bus)
+    command = await sentinel.rpc_subnet_rules_command(
         operation="DENY",
         rules=["1.2.3.0/24"],
         discord_id="42",
         target_server="s",
         timeout_ms=1234,
     )
-    listed = await bus.rpc_subnet_rules_list("s", 1234)
-    checked = await bus.rpc_subnet_rules_check("s", "1.2.3.4", 1234)
+    listed = await sentinel.rpc_subnet_rules_list("s", 1234)
+    checked = await sentinel.rpc_subnet_rules_check("s", "1.2.3.4", 1234)
     assert isinstance(command, SentinelSubnetRulesResponseV1)
     assert isinstance(listed, SentinelSubnetRulesListResponseV1)
     assert isinstance(checked, SentinelSubnetRulesCheckResponseV1)

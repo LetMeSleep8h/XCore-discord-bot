@@ -121,7 +121,7 @@ async def test_case_sanction_log_redacts_raw_nickname_reason_and_actor_once(verb
     move(service, TARGET_UUID, nickname=raw_name)
     raw_reason = f"reason {REPORTER_UUID} {TARGET_UUID} {SECOND_UUID} {REPORTER_IP}"
     actor_uuid, actor_ip = "ZFn+OcdYThKXkqd/KCsPyA==", "203.0.113.25"
-    service.players.database["players"].docs.append(
+    service.player_store.database["players"].docs.append(
         {"uuid": actor_uuid, "pid": 50, "discord_id": str(STAFF), "ip": actor_ip}
     )
     staff = member()
@@ -254,7 +254,7 @@ async def test_unknown_subject_claims_unique_key_in_guarded_checkpoint_before_mu
 ):
     service, db, bot = await reports_core()
     _, case = await panel(service, bot, {"who": "unknown", "what": "grief"})
-    original = bot.store.upsert_mute
+    original = bot.container.punishments.upsert_mute
 
     async def checked(**kwargs):
         current = await service.get(case.number)
@@ -266,7 +266,7 @@ async def test_unknown_subject_claims_unique_key_in_guarded_checkpoint_before_mu
         assert len(db["cases"].docs) == 1
         return await original(**kwargs)
 
-    monkeypatch.setattr(bot.store, "upsert_mute", checked)
+    monkeypatch.setattr(bot.container.punishments, "upsert_mute", checked)
     closed = await sanction(service, case, "mute")
     assert (
         closed.dedup_key == f"report:{TARGET_UUID}"
@@ -394,14 +394,14 @@ async def test_current_link_is_checked_after_fresh_subject_under_guard(
         case = await open_report(service)
     else:
         _, case = await panel(service, bot, {"who": "unknown", "what": "grief"})
-    lookup = service.players.find_player_by_pid
+    lookup = service.player_store.find_player_by_pid
 
     async def linking(pid):
         if (await service.get(case.number)).pending_action:
             move(service, TARGET_UUID, discord_id=str(STAFF))
         return await lookup(pid)
 
-    monkeypatch.setattr(service.players, "find_player_by_pid", linking)
+    monkeypatch.setattr(service.player_store, "find_player_by_pid", linking)
     with pytest.raises(AccessDenied):
         await sanction(service, case, "mute")
     assert not bot.mutations["mutes"].docs
@@ -502,7 +502,7 @@ async def test_panel_reporter_merged_during_real_action_gets_thread_before_close
     service, _, bot = await reports_core()
     case = await open_report(service)
     started, proceed = asyncio.Event(), asyncio.Event()
-    upsert = bot.store.upsert_mute
+    upsert = bot.container.punishments.upsert_mute
 
     async def blocked(**kwargs):
         assert (await service.get(case.number)).pending_action
@@ -510,7 +510,7 @@ async def test_panel_reporter_merged_during_real_action_gets_thread_before_close
         await proceed.wait()
         return await upsert(**kwargs)
 
-    monkeypatch.setattr(bot.store, "upsert_mute", blocked)
+    monkeypatch.setattr(bot.container.punishments, "upsert_mute", blocked)
     task = asyncio.create_task(sanction(service, case, "mute"))
     await asyncio.wait_for(started.wait(), 2)
     try:
@@ -903,7 +903,9 @@ async def test_actual_base64_party_identifiers_are_redacted_in_case_logs_and_con
         "QN+LpSqDSQehxjwAgP0veA==",
         "Bw/oPEzyQ5G+GdT4EYmqWQ==",
     )
-    for row, uuid in zip(service.players.database["players"].docs, ids, strict=True):
+    for row, uuid in zip(
+        service.player_store.database["players"].docs, ids, strict=True
+    ):
         row["uuid"] = uuid
     first = report(
         reporter=PlayerRefV1(ids[0], "Reporter", 0),
@@ -920,7 +922,7 @@ async def test_actual_base64_party_identifiers_are_redacted_in_case_logs_and_con
         ),
     )
     case = await service.store.by_submission(first.submissionId)
-    service.players.database["players"].docs[1]["nickname"] = "Target " + ids[0]
+    service.player_store.database["players"].docs[1]["nickname"] = "Target " + ids[0]
     values = {"pid": "-5", "duration": "1d", "reason": "raw " + " ".join(ids)}
     _, asked = await act(service, case, verb, values=values)
     assert all(uuid not in " ".join(asked.followup.texts()) for uuid in ids)
@@ -1084,6 +1086,6 @@ async def test_saturated_ambiguous_name_still_returns_two_candidates_and_panel_i
     store._db = {"players": _RegexPlayers(rows)}
     assert len(await store.find_players_by_exact_name("Bob")) == 2
     service, _, bot = await reports_core()
-    service.players.find_players_by_exact_name = store.find_players_by_exact_name
+    service.player_store.find_players_by_exact_name = store.find_players_by_exact_name
     _, case = await panel(service, bot, {"who": "Bob", "what": "grief"})
     assert case.subject is None and reports.UNRESOLVED in case.flags

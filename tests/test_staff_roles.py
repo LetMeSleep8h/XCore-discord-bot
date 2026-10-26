@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 from aiohttp import ClientConnectionError
-from bot_fakes import make_bot
+from bot_fakes import make_bot, make_rpc
 from pydantic import ValidationError
 from redis.exceptions import RedisError
 from xcore_protocol.generated.discord import (
@@ -20,12 +20,13 @@ from xcore_protocol.generated.security import (
 )
 from xcore_protocol.generated.shared import DiscordIdentityRefV1, PlayerRefV1
 
+from xcore_discord_bot.bus.moderation import ModerationBus
+from xcore_discord_bot.bus.transport import RedisTransport, RpcFailed
 from xcore_discord_bot.container import ServiceContainer
-from xcore_discord_bot.daemons.staff_sync_daemon import StaffSyncDaemon
+from xcore_discord_bot.daemons.staff_sync_daemon import StaffSyncDaemon, StaffSyncResult
 from xcore_discord_bot.dto import PlayerRecord
 from xcore_discord_bot.mongo_store import MongoStore
-from xcore_discord_bot.redis_bus import RedisBus, RpcFailed
-from xcore_discord_bot.rpc.mindustry_rpc import MindustryRpcClient
+from xcore_discord_bot.registry import LiveServerRegistry
 from xcore_discord_bot.services.player_service import PlayerService
 from xcore_discord_bot.settings import Settings
 
@@ -133,7 +134,7 @@ async def test_retry_reuses_operation_id_and_new_attempt_changes_it(error):
         return SecurityStaffSyncResponseV1(request.server, request.operationId, 1, True)
 
     bus.rpc_staff_sync = AsyncMock(side_effect=sync)
-    rpc = MindustryRpcClient(bus)
+    rpc = make_rpc(bus)
     kwargs = {
         "server": "mini-pvp",
         "player_uuid": "uuid-1",
@@ -215,8 +216,8 @@ async def test_scheduled_check_every_linked_account_rate_limited(setup, monkeypa
     )
     daemon.MIN_REQUEST_INTERVAL_SECONDS = 0.25
     result = await daemon.reconcile()
-    assert result["synced"] == 3
-    assert result["skipped_count"] == 0
+    assert result.synced == 3
+    assert result.skipped == 0
     assert rpc.sync_staff.await_count == 3
     assert [call.args for call in sleeps.await_args_list if call.args != (0,)] == [
         (0.25,),
@@ -234,7 +235,14 @@ async def test_password_reset_both_modes(settings, mode):
     bus.publish_player_password_reset = AsyncMock()
     rpc = MagicMock()
     rpc.reset_staff_password = AsyncMock(return_value=SimpleNamespace(changed=True))
-    service = PlayerService(store, bus, settings=settings, rpc=rpc)
+    service = PlayerService(
+        store,
+        settings=settings,
+        rpc=rpc,
+        accounts=bus,
+        moderation=ModerationBus(bus, LiveServerRegistry()),
+        merges=MagicMock(),
+    )
     assert await service.reset_password(uuid="uuid-1")
     if mode == "legacy":
         store.reset_password.assert_awaited_once_with(uuid="uuid-1")
@@ -263,7 +271,7 @@ async def test_password_reset_retry_reuses_request():
         )
 
     bus.rpc_staff_reset_password = AsyncMock(side_effect=reset)
-    await MindustryRpcClient(bus).reset_staff_password(
+    await make_rpc(bus).reset_staff_password(
         server="mini-pvp", player_uuid="uuid-1", timeout_ms=100
     )
     assert requests[0] is requests[1]
@@ -283,13 +291,16 @@ def test_legacy_container_does_not_load_roles_config(settings):
     legacy = settings.model_copy(
         update={"permissions_mode": "legacy", "permissions_config_path": "/missing"}
     )
-    assert ServiceContainer.create(legacy, MagicMock()).staff_sync_daemon is None
+    container = ServiceContainer.create(
+        legacy, MagicMock(), store=MongoStore(legacy), bus=RedisTransport(legacy)
+    )
+    assert container.staff_sync_daemon is None
 
 
 async def test_generated_rpc_wire_payload_and_response(settings):
     import json
 
-    bus = RedisBus(settings)
+    bus = RedisTransport(settings)
 
     async def respond(**kwargs):
         payload = kwargs["payload"]
@@ -302,8 +313,8 @@ async def test_generated_rpc_wire_payload_and_response(settings):
         )
         return {"payload_json": json.dumps(response.to_payload())}
 
-    bus._rpc_request = AsyncMock(side_effect=respond)
-    response = await MindustryRpcClient(bus).sync_staff(
+    bus.rpc_request = AsyncMock(side_effect=respond)
+    response = await make_rpc(bus).sync_staff(
         server="mini-pvp",
         player_uuid="uuid-1",
         discord_id="456",
@@ -318,7 +329,7 @@ async def test_schedule_loop_starts_after_ready_and_continues(setup, monkeypatch
     daemon._bot.wait_until_ready = AsyncMock()
     daemon._bot.is_closed.side_effect = [False, False, True]
     daemon.reconcile = AsyncMock(
-        side_effect=[RuntimeError("db unavailable"), {"synced": 0}]
+        side_effect=[RuntimeError("db unavailable"), StaffSyncResult(0, 0)]
     )
     sleep = AsyncMock()
     monkeypatch.setattr(
@@ -335,7 +346,7 @@ async def test_schedule_loop_starts_after_ready_and_continues(setup, monkeypatch
 async def test_link_status_consumer_reconnects_the_bus(setup, monkeypatch):
     daemon, _, _, _ = setup
     bus = daemon._bot.bus
-    bus.consume_discord_link_status_changed = AsyncMock(
+    daemon._bot.container.accounts_bus.consume_discord_link_status_changed = AsyncMock(
         side_effect=[RedisError("connection lost"), asyncio.CancelledError()]
     )
     bus.reconnect = AsyncMock()
@@ -356,12 +367,14 @@ async def test_roles_command_link_does_not_write_admin(settings):
     bot = MagicMock()
     bot.settings.roles_mode = True
     bot.bus.claim_idempotency = AsyncMock(return_value=True)
-    bot.bus.get_discord_link_code = AsyncMock(return_value={"playerUuid": "uuid-1"})
+    bot.container.accounts_bus.get_discord_link_code = AsyncMock(
+        return_value={"playerUuid": "uuid-1"}
+    )
     bot.store.now_utc = lambda: datetime.now(UTC)
     bot.store.find_player_by_uuid = AsyncMock(
         return_value=PlayerRecord(pid=1, uuid="uuid-1", nickname="p")
     )
-    bot.bus.publish_discord_link_confirm = AsyncMock()
+    bot.container.accounts_bus.publish_discord_link_confirm = AsyncMock()
     bot.store.set_admin_access = AsyncMock()
     bot.container.admin_sync_daemon.get_discord_admin_member_ids = AsyncMock(
         return_value={"456"}
@@ -372,7 +385,7 @@ async def test_roles_command_link_does_not_write_admin(settings):
         response=SimpleNamespace(send_message=AsyncMock()),
     )
     await cmd_link(bot, interaction, "CODE")
-    bot.bus.publish_discord_link_confirm.assert_awaited_once()
+    bot.container.accounts_bus.publish_discord_link_confirm.assert_awaited_once()
     bot.container.admin_sync_daemon.get_discord_admin_member_ids.assert_not_awaited()
     bot.store.set_admin_access.assert_not_awaited()
 
@@ -388,7 +401,14 @@ async def test_roles_password_command_uses_rpc_without_legacy_event(settings):
     rpc.reset_staff_password = AsyncMock(return_value=SimpleNamespace(changed=True))
     bot = make_bot(settings=settings, bus=bus, store=store)
     bot.container = SimpleNamespace(
-        players=PlayerService(store, bus, settings=settings, rpc=rpc)
+        players=PlayerService(
+            store,
+            settings=settings,
+            rpc=rpc,
+            accounts=bus,
+            moderation=ModerationBus(bus, LiveServerRegistry()),
+            merges=MagicMock(),
+        )
     )
     bot.store.find_player_by_pid = AsyncMock(
         return_value=PlayerRecord(pid=1, uuid="uuid-1", nickname="p")
@@ -408,7 +428,7 @@ async def test_roles_password_command_uses_rpc_without_legacy_event(settings):
 async def test_reset_password_generated_wire_payload(settings):
     import json
 
-    bus = RedisBus(settings)
+    bus = RedisTransport(settings)
 
     async def respond(**kwargs):
         payload = kwargs["payload"]
@@ -420,9 +440,9 @@ async def test_reset_password_generated_wire_payload(settings):
         )
         return {"payload_json": json.dumps(response.to_payload())}
 
-    bus._rpc_request = AsyncMock(side_effect=respond)
+    bus.rpc_request = AsyncMock(side_effect=respond)
     assert (
-        await MindustryRpcClient(bus).reset_staff_password(
+        await make_rpc(bus).reset_staff_password(
             server="mini-pvp", player_uuid="uuid-1", timeout_ms=100
         )
     ).changed
@@ -434,7 +454,7 @@ async def test_not_found_is_not_retried():
         side_effect=RpcFailed("security.staff.sync.request", "NOT_FOUND", "not linked")
     )
     with pytest.raises(RpcFailed, match="NOT_FOUND"):
-        await MindustryRpcClient(bus).sync_staff(
+        await make_rpc(bus).sync_staff(
             server="mini-pvp",
             player_uuid="uuid-1",
             discord_id="456",
@@ -491,7 +511,7 @@ async def test_scheduled_snapshot_once_and_absent_account_revoked(setup, caplog)
     )
     with caplog.at_level(logging.INFO):
         result = await daemon.reconcile()
-    assert result["synced"] == 3
+    assert result.synced == 3
     guild.fetch_roles.assert_awaited_once()
     guild.fetch_members.assert_called_once_with(limit=None)
     guild.fetch_member.assert_not_awaited()
@@ -538,9 +558,9 @@ async def test_incomplete_scheduled_snapshot_revokes_nothing(setup, failure):
     else:
         guild.fetch_members.side_effect = members
     result = await daemon.reconcile()
-    assert result["synced"] == 0
-    assert result["skipped_count"] == 1
-    assert result["reason"]
+    assert result.synced == 0
+    assert result.skipped == 1
+    assert result.reason
     rpc.sync_staff.assert_not_awaited()
 
 
@@ -566,14 +586,14 @@ async def test_pass_does_not_overlap_or_block_event_sync(setup):
     try:
         await entered.wait()
         result = await daemon.reconcile()
-        assert "already running" in result["reason"]
+        assert "already running" in result.reason
         guild.fetch_roles.assert_awaited_once()
         assert await daemon.sync_player("uuid-1", "456")
         release.set()
         result = await task
         # The old snapshot cannot undo the event that ran while it was fetched.
-        assert result["synced"] == 0
-        assert result["skipped_count"] == 1
+        assert result.synced == 0
+        assert result.skipped == 1
         rpc.sync_staff.assert_awaited_once()
     finally:
         task.cancel()
@@ -604,12 +624,12 @@ async def test_expected_rpc_errors_summarized_and_legacy_stops_pass(
     rpc.sync_staff.side_effect = errors if legacy else errors * 5
     with caplog.at_level(logging.INFO):
         result = await daemon.reconcile()
-    assert result["skipped_count"] == 10
+    assert result.skipped == 10
     assert rpc.sync_staff.await_count == (2 if legacy else 10)
     assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 2
     assert all(r.exc_info is None for r in caplog.records)
     assert len([r for r in caplog.records if "Staff sync pass:" in r.message]) == 1
-    assert bool(result["reason"]) is legacy
+    assert bool(result.reason) is legacy
 
 
 @pytest.mark.parametrize("command", ["reset", "add", "remove", "sync"])
@@ -637,7 +657,7 @@ async def test_roles_deferred_command_reports_rpc_failure(command, error, expect
     bot.store.find_players_by_discord_id = AsyncMock(return_value=[player])
     bot.set_discord_admin_role = AsyncMock(return_value=True)
     bot.container.players.reset_password = AsyncMock(side_effect=error)
-    bot.bus.publish_player_password_reset = AsyncMock()
+    bot.container.accounts_bus.publish_player_password_reset = AsyncMock()
     daemon = SimpleNamespace(
         sync_member=AsyncMock(side_effect=error), reconcile=AsyncMock(side_effect=error)
     )
@@ -659,7 +679,7 @@ async def test_roles_deferred_command_reports_rpc_failure(command, error, expect
     interaction.response.defer.assert_awaited_once()
     interaction.followup.send.assert_awaited_once()
     assert expected in interaction.followup.send.await_args.args[0]
-    bot.bus.publish_player_password_reset.assert_not_awaited()
+    bot.container.accounts_bus.publish_player_password_reset.assert_not_awaited()
 
 
 @pytest.mark.parametrize("command", ["add", "remove", "sync"])
@@ -680,7 +700,7 @@ async def test_roles_commands_report_sync_outcome(command, synced, skipped, erro
     bot.bus.claim_idempotency = AsyncMock(return_value=True)
     bot.store.find_players_by_discord_id = AsyncMock(return_value=[player])
     bot.set_discord_admin_role = AsyncMock(return_value=True)
-    result = {"synced": synced, "skipped_count": skipped, "errors": errors}
+    result = StaffSyncResult(synced, skipped, tuple(errors))
     daemon = SimpleNamespace(
         sync_member=AsyncMock(return_value=result),
         reconcile=AsyncMock(return_value=result),
@@ -739,7 +759,7 @@ async def test_event_sync_runs_between_scheduled_requests(setup):
         await event_started.wait()
         release_first.set()
         assert await event
-        assert (await scheduled)["synced"] == 2
+        assert (await scheduled).synced == 2
         assert order == ["scheduled-1", "event-player", "scheduled-2"]
     finally:
         scheduled.cancel()
@@ -761,7 +781,7 @@ async def test_schedule_does_not_add_pass_duration_to_interval(setup, monkeypatc
 
     async def reconcile():
         clock[0] += 250
-        return {"synced": 1000}
+        return StaffSyncResult(1000, 0)
 
     sleeps = AsyncMock(side_effect=sleep)
     daemon.reconcile = AsyncMock(side_effect=reconcile)

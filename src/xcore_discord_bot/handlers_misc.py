@@ -24,7 +24,6 @@ from .presentation import (
     format_size,
 )
 from .rating_store import Placing
-from .retry import retry_read_rpc
 from .server_views import MapsListView, ServersView
 from .staff_actions import (
     Actor,
@@ -169,7 +168,7 @@ async def _loaded(awaitable: Awaitable[T], what: str, player: PlayerRecord) -> T
     """A section of the stats, or ``None`` when it cannot be read: the rest still opens."""
     try:
         return await awaitable
-    except Exception:
+    except Exception:  # the rest of the stats still opens
         logger.exception("Cannot load %s for player #%s", what, player.pid)
         return None
 
@@ -179,10 +178,12 @@ async def _staff_notes(bot: XCoreDiscordBot, player: PlayerRecord) -> StaffNotes
         return StaffNotes()
     try:
         return StaffNotes(
-            ban=await bot.store.find_ban(uuid=player.uuid, ip=player.ip),
-            mute=await bot.store.find_mute(uuid=player.uuid),
+            ban=await bot.container.punishments.find_ban(
+                uuid=player.uuid, ip=player.ip
+            ),
+            mute=await bot.container.punishments.find_mute(uuid=player.uuid),
         )
-    except Exception:
+    except Exception:  # the rest of the stats still opens
         logger.exception("Cannot load punishments for player #%s", player.pid)
         return StaffNotes(loaded=False)
 
@@ -347,7 +348,7 @@ async def cmd_stats_audit(
     if mode == "actor":
         actor_discord_id = str(player.discord_id or "").strip() or None
         actor_id = nickname
-        total_entries = await bot.store.count_audit_for_actor(
+        total_entries = await bot.container.audit.count_audit_for_actor(
             actor_id=actor_id,
             actor_discord_id=actor_discord_id,
         )
@@ -359,19 +360,21 @@ async def cmd_stats_audit(
                 ephemeral=True,
             )
             return
-        total_entries = await bot.store.count_audit_for_player(uuid=uuid_value)
+        total_entries = await bot.container.audit.count_audit_for_player(
+            uuid=uuid_value
+        )
     total_pages = max(1, (total_entries + page_size - 1) // page_size)
 
     async def fetch_page(page: int) -> tuple[discord.Embed, bool]:
         if mode == "actor":
-            rows = await bot.store.list_audit_for_actor(
+            rows = await bot.container.audit.list_audit_for_actor(
                 actor_id=actor_id,
                 actor_discord_id=actor_discord_id,
                 limit=page_size,
                 page=page,
             )
         else:
-            rows = await bot.store.list_audit_for_player(
+            rows = await bot.container.audit.list_audit_for_player(
                 uuid=uuid_value, limit=page_size, page=page
             )
         embed = discord.Embed(
@@ -414,7 +417,7 @@ async def cmd_stats_audit(
 
 
 async def cmd_servers(bot: XCoreDiscordBot, interaction: Interaction) -> None:
-    view = ServersView(sort_mode="players")
+    view = ServersView(bot.container.servers, sort_mode="players")
     await interaction.response.send_message(embed=view.build_embed(), view=view)
     view.bot_message = await interaction.original_response()
 
@@ -467,11 +470,11 @@ async def cmd_bans(
     name_filter: str | None,
 ) -> None:
     page_size = 6
-    total_bans = await bot.store.count_bans(name_filter=name_filter)
+    total_bans = await bot.container.punishments.count_bans(name_filter=name_filter)
     total_pages = max(1, (total_bans + page_size - 1) // page_size)
 
     async def fetch_page(page: int) -> tuple[discord.Embed, bool]:
-        bans = await bot.store.list_bans(
+        bans = await bot.container.punishments.list_bans(
             name_filter=name_filter, limit=page_size, page=page
         )
         embed = discord.Embed(
@@ -515,7 +518,7 @@ async def cmd_maps(
 ) -> None:
     await interaction.response.defer()
     try:
-        maps = await bot.bus.rpc_maps_list(
+        maps = await bot.container.rpc.list_maps(
             server=server, timeout_ms=bot.settings.rpc_timeout_ms
         )
     except TimeoutError:
@@ -577,9 +580,7 @@ async def get_cached_maps(bot: XCoreDiscordBot, server: str) -> list[dict[str, s
             return maps
 
     try:
-        maps = await retry_read_rpc(
-            lambda: bot.bus.rpc_maps_list(server=server, timeout_ms=3000)
-        )
+        maps = await bot.container.rpc.list_maps(server=server, timeout_ms=3000)
         bot.map_cache[server] = (now, maps)
         return maps
     except TimeoutError:
@@ -626,7 +627,7 @@ async def perform_remove_map(
         return "This map removal was already processed."
 
     try:
-        result = await bot.bus.rpc_remove_map(
+        result = await bot.container.rpc.remove_map(
             server=server,
             file_name=file_name,
             timeout_ms=bot.settings.rpc_timeout_ms,

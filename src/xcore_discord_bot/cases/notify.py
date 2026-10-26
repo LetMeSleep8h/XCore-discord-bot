@@ -49,7 +49,7 @@ class CaseNotifier:
         # ``uuid -> PlayerRecord | None``: the in-game language and the server to wake up.
         self.find_player = find_player
 
-    async def send(self, service, case: Case, outcome: Outcome) -> None:
+    async def send(self, service, case: Case, outcome: Outcome) -> None:  # noqa: C901
         """Deliver once per channel; what was delivered is recorded on the case, so a repeat
         after a failure sends only what is still missing."""
         party = outcome.recipient
@@ -87,7 +87,7 @@ class CaseNotifier:
                 await self._notice(service, case, outcome, params, player)
                 receipt = {**receipt, "notice": True}
                 await self._receipt(service, case.number, delivery_key, receipt)
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 -- collected; raised together so delivery is retried
                 errors.append(error)
         if not discord_id or not discord_id.isdigit():
             if errors:
@@ -129,7 +129,7 @@ class CaseNotifier:
                     await self._receipt(service, case.number, delivery_key, receipt)
                 elif required:
                     raise CaseRace("Reporter's owned thread is missing")
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 -- collected; raised together so delivery is retried
                 errors.append(error)
         if not receipt.get("dm") and not receipt.get("dm_unavailable"):
             try:
@@ -144,7 +144,7 @@ class CaseNotifier:
                     await self._receipt(service, case.number, delivery_key, receipt)
                 else:
                     errors.append(error)
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 -- collected; raised together so delivery is retried
                 errors.append(error)
             else:
                 receipt = {**receipt, "dm": True}
@@ -182,7 +182,7 @@ class CaseNotifier:
             await service.transport.publish_case_notice(
                 notice_id=notice_id, player_uuid=party.player_uuid, server=server
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 -- best-effort wake-up; join delivery remains
             log_failure(
                 logger,
                 case.kind,

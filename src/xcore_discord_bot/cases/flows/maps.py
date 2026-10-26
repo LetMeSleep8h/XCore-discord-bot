@@ -14,9 +14,8 @@ from uuid import uuid4
 import discord
 from xcore_protocol.generated.maps import MapsInspectResponseV1
 
+from ...bus.transport import RpcError
 from ...i18n import resolve_dm_locale, t
-from ...redis_bus import RpcError
-from ...registry import server_registry
 from ...retry import TRANSIENT_EXCEPTIONS
 from ...rpc.mindustry_rpc import NoLiveServerError
 from ...staff_actions import (
@@ -280,7 +279,7 @@ async def _attachment(service, case, *, locale=None):
     return attachment
 
 
-async def _refresh(service, case, *, message=None):
+async def _refresh(service, case, *, message=None):  # noqa: C901
     # All writes use the revision actually inspected. A concurrent Accept or replacement
     # wins rather than receiving stale results from a slow inspection.
     payload = dict(case.payload)
@@ -465,7 +464,7 @@ def _ready(case, locale):
         raise ActionFailed(t(locale, "maps-not-valid"))
 
 
-async def accept(context: ActionContext):
+async def accept(context: ActionContext):  # noqa: C901
     case = context.case
     _ready(case, context.locale)
     stamp = context.values.setdefault("review_stamp", case.payload["review_stamp"])
@@ -473,7 +472,7 @@ async def accept(context: ActionContext):
         raise ActionFailed(t(context.locale, "maps-review-changed"))
     profile = case.payload.get("profile") or case.payload.get("info", {}).get("profile")
     servers = sorted(
-        server_registry.get_all_servers(),
+        context.service.bot.container.servers.get_all_servers(),
         key=lambda s: (s.mode != profile, s.name),
     )
     if not servers:
@@ -641,7 +640,7 @@ async def _badge(service, case):
             actor=Actor(case.resolution.by_discord_id, case.resolution.by_name or ""),
             request_id=f"map-maker:{case.number}",
         )
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 -- recorded; reconcile retries the pending badge
         await service._note_error(case.number, "map_maker", error)
         return
     await service.checkpoint(
@@ -773,7 +772,7 @@ def _finding(finding, locale):
     return text[:350]
 
 
-def card_builder(case, locale):
+def card_builder(case, locale):  # noqa: C901
     embed = base_card(case, locale)
     # Bound the free-text fields before allocating space to grouped findings.
     for index, field in enumerate(embed.fields):

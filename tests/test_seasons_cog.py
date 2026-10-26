@@ -10,10 +10,10 @@ from discord import app_commands
 from xcore_protocol.generated.rating import RatingSeasonRescheduleResponseV1
 from xcore_protocol.generated.shared import SeasonRefV1
 
+from xcore_discord_bot.bus.transport import RpcFailed, RpcRejected
 from xcore_discord_bot.cogs.checks import head_admin_check
 from xcore_discord_bot.cogs.seasons import SeasonsCog, parse_end_at
 from xcore_discord_bot.permissions import head_admin_role_ids
-from xcore_discord_bot.redis_bus import RpcFailed, RpcRejected
 from xcore_discord_bot.rpc.mindustry_rpc import NoLiveServerError
 
 ADMIN, HEAD = 10, 20
@@ -154,10 +154,16 @@ async def test_extend_rejects_a_bad_duration_without_calling_the_server() -> Non
 @pytest.mark.parametrize(
     ("error", "expected"),
     [
-        (RpcRejected("rating.season.reschedule.request", "REJECTED", "too late"), "too late"),
+        (
+            RpcRejected("rating.season.reschedule.request", "REJECTED", "too late"),
+            "too late",
+        ),
         (NoLiveServerError("none"), "No Mindustry server"),
         (TimeoutError(), "did not answer"),
-        (RpcFailed("rating.season.reschedule.request", "FAILED", "boom"), "could not carry"),
+        (
+            RpcFailed("rating.season.reschedule.request", "FAILED", "boom"),
+            "could not carry",
+        ),
     ],
 )
 async def test_admin_failures_are_worded_for_the_admin(error, expected) -> None:

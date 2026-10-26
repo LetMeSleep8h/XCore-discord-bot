@@ -27,12 +27,12 @@ from .handlers_seasons import (
 )
 from .moderation_logs import post_ban_log, post_mute_log, post_vote_kick_log
 from .player_pids import NO_PID
-from .registry import server_registry
 from .retry import retry_reconnect_bus
 from .utils.mindustry_colors import strip_mindustry_colors
 
 if TYPE_CHECKING:
     from .bot import XCoreDiscordBot
+    from .bus.transport import RedisTransport
     from .contracts import (
         ModerationBanCreatedV1,
         ModerationMuteCreatedV1,
@@ -41,7 +41,6 @@ if TYPE_CHECKING:
         ServerActionV1,
     )
     from .mongo_store import MongoStore
-    from .redis_bus import RedisBus
 
 
 logger = logging.getLogger(__name__)
@@ -86,7 +85,7 @@ async def _player_pid_for_uuid(store: MongoStore, uuid: str | None) -> int:
 async def _server_channel(
     bot: XCoreDiscordBot, server: str, *, context: str
 ) -> Messageable | None:
-    channel_id = server_registry.get_channel_for_server(server)
+    channel_id = bot.container.servers.get_channel_for_server(server)
     if channel_id is None:
         logger.debug("No channel registered for server=%s (%s)", server, context)
         return None
@@ -104,7 +103,7 @@ async def consume_game_chat(bot: XCoreDiscordBot) -> None:
         await channel.send(f"`{safe_author}: {safe_message}`")
 
     await run_consumer_forever(
-        bot.bus, "Game chat", bot.bus.consume_game_chat, dispatch
+        bot.bus, "Game chat", bot.container.chat_bus.consume_game_chat, dispatch
     )
 
 
@@ -120,7 +119,7 @@ async def consume_global_chat(bot: XCoreDiscordBot) -> None:
         await channel.send(f"`[GLOBAL:{safe_server}] {safe_author}: {safe_message}`")
 
     await run_consumer_forever(
-        bot.bus, "Global chat", bot.bus.consume_global_chat, dispatch
+        bot.bus, "Global chat", bot.container.chat_bus.consume_global_chat, dispatch
     )
 
 
@@ -131,7 +130,7 @@ async def consume_server_heartbeats(bot: XCoreDiscordBot) -> None:
     await run_consumer_forever(
         bot.bus,
         "Server heartbeat",
-        bot.bus.consume_server_heartbeats,
+        bot.container.chat_bus.consume_server_heartbeats,
         dispatch,
     )
 
@@ -149,7 +148,7 @@ async def consume_join_leave(bot: XCoreDiscordBot) -> None:
     await run_consumer_forever(
         bot.bus,
         "Join/leave",
-        bot.bus.consume_player_join_leave,
+        bot.container.chat_bus.consume_player_join_leave,
         dispatch,
     )
 
@@ -166,7 +165,7 @@ async def consume_server_actions(bot: XCoreDiscordBot) -> None:
     await run_consumer_forever(
         bot.bus,
         "Server action",
-        bot.bus.consume_server_actions,
+        bot.container.chat_bus.consume_server_actions,
         dispatch,
     )
 
@@ -205,7 +204,7 @@ async def consume_case_reports(bot: XCoreDiscordBot) -> None:
         await service.registry.dispatch_event(CASE_REPORT_EVENT, service, payload)
 
     async def consume(callback) -> None:
-        await bot.bus.consume_case_reports(
+        await bot.container.cases_bus.consume_case_reports(
             callback, is_active=lambda: case_reports_active(bot)
         )
 
@@ -241,14 +240,16 @@ async def consume_bans(bot: XCoreDiscordBot) -> None:
                         f"{bot.settings.discord_bans_channel_id} is unresolved"
                     )
 
-            await bot.bus.run_ban_log_once(event, log)
+            await bot.container.moderation_bus.run_ban_log_once(event, log)
         service = bot.container.cases
         if service.settings.cases_enabled and service.storage_available:
             # A hook failure reaches Redis retry/DLQ. The completed log marker
             # survives that retry, so auto-resolution can finish without another log.
             await service.registry.dispatch_event(CASE_BAN_EVENT, service, event)
 
-    await run_consumer_forever(bot.bus, "Ban", bot.bus.consume_bans, dispatch)
+    await run_consumer_forever(
+        bot.bus, "Ban", bot.container.moderation_bus.consume_bans, dispatch
+    )
 
 
 async def consume_mutes(bot: XCoreDiscordBot) -> None:
@@ -276,7 +277,9 @@ async def consume_mutes(bot: XCoreDiscordBot) -> None:
                 # again. The mute is in the audit trail, where the repair task finds it.
                 logger.exception("Case hooks failed for a mute event")
 
-    await run_consumer_forever(bot.bus, "Mute", bot.bus.consume_mutes, dispatch)
+    await run_consumer_forever(
+        bot.bus, "Mute", bot.container.moderation_bus.consume_mutes, dispatch
+    )
 
 
 async def consume_vote_kicks(bot: XCoreDiscordBot) -> None:
@@ -297,7 +300,7 @@ async def consume_vote_kicks(bot: XCoreDiscordBot) -> None:
         )
 
     await run_consumer_forever(
-        bot.bus, "Vote-kick", bot.bus.consume_vote_kicks, dispatch
+        bot.bus, "Vote-kick", bot.container.moderation_bus.consume_vote_kicks, dispatch
     )
 
 
@@ -306,7 +309,10 @@ async def consume_season_started(bot: XCoreDiscordBot) -> None:
         await on_season_started(bot, event)
 
     await run_consumer_forever(
-        bot.bus, "Season started", bot.bus.consume_season_started, dispatch
+        bot.bus,
+        "Season started",
+        bot.container.rating_bus.consume_season_started,
+        dispatch,
     )
 
 
@@ -315,7 +321,10 @@ async def consume_season_ending_soon(bot: XCoreDiscordBot) -> None:
         await on_season_ending_soon(bot, event)
 
     await run_consumer_forever(
-        bot.bus, "Season ending soon", bot.bus.consume_season_ending_soon, dispatch
+        bot.bus,
+        "Season ending soon",
+        bot.container.rating_bus.consume_season_ending_soon,
+        dispatch,
     )
 
 
@@ -324,7 +333,7 @@ async def consume_season_ended(bot: XCoreDiscordBot) -> None:
         await on_season_ended(bot, event)
 
     await run_consumer_forever(
-        bot.bus, "Season ended", bot.bus.consume_season_ended, dispatch
+        bot.bus, "Season ended", bot.container.rating_bus.consume_season_ended, dispatch
     )
 
 
@@ -333,12 +342,15 @@ async def consume_season_rescheduled(bot: XCoreDiscordBot) -> None:
         await on_season_rescheduled(bot, event)
 
     await run_consumer_forever(
-        bot.bus, "Season rescheduled", bot.bus.consume_season_rescheduled, dispatch
+        bot.bus,
+        "Season rescheduled",
+        bot.container.rating_bus.consume_season_rescheduled,
+        dispatch,
     )
 
 
 async def run_consumer_forever(
-    bus: RedisBus,
+    bus: RedisTransport,
     label: str,
     consume: Callable[[Callable[..., Awaitable[None]]], Awaitable[None]],
     callback: Callable[..., Awaitable[None]],
@@ -348,7 +360,7 @@ async def run_consumer_forever(
             await consume(callback)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception:  # a crashed consumer reconnects and resumes
             logger.exception("%s consumer crashed; reconnecting in 2s", label)
             await asyncio.sleep(2)
             try:

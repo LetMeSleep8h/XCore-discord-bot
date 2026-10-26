@@ -4,17 +4,19 @@ from dataclasses import dataclass
 from datetime import timedelta
 from types import MethodType, SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
+from bot_fakes import make_rpc
 from xcore_protocol.generated.rating import RatingSeasonRescheduleRequestV1Operation
 
+from xcore_discord_bot.bus.rating import RatingBus
+from xcore_discord_bot.bus.transport import RedisTransport, RpcFailed, RpcRejected
 from xcore_discord_bot.daemons.rating_merge_daemon import RatingMergeDaemon
 from xcore_discord_bot.dto import AccountMergeResult, PlayerRecord
-from xcore_discord_bot.redis_bus import RedisBus, RpcFailed, RpcRejected
-from xcore_discord_bot.registry import server_registry
+from xcore_discord_bot.registry import LiveServerRegistry
 from xcore_discord_bot.rpc.mindustry_rpc import (
     MAX_SERVERS_TRIED,
-    MindustryRpcClient,
     NoLiveServerError,
 )
 from xcore_discord_bot.services.player_service import PlayerService
@@ -187,6 +189,46 @@ async def test_a_queued_merge_stays_until_a_server_answers() -> None:
     assert store.pending == {("s", "t")}
 
 
+@pytest.mark.asyncio
+async def test_an_unexpected_merge_failure_is_logged_with_its_traceback_and_queued(
+    caplog,
+) -> None:
+    service, store, _ = _service(KeyError("bug"), KeyError("bug"))
+
+    outcome = await service.merge_standings("s", "t")
+    # The accounts are already merged, so the ratings must not be dropped.
+    assert (outcome.merged, outcome.queued) == (False, True)
+    assert store.pending == {("s", "t")}
+
+    report = await service.retry_pending_merges()
+    assert (report.delivered, report.refused) == (0, ())
+    assert store.pending == {("s", "t")}
+
+    unexpected = [r for r in caplog.records if "failed unexpectedly" in r.message]
+    assert len(unexpected) == 2
+    assert all(r.exc_info and r.exc_info[0] is KeyError for r in unexpected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        NoLiveServerError("offline"),
+        RpcFailed("rating.accounts.merge.request", "FAILED", "busy"),
+        TimeoutError(),
+        ConnectionError(),
+    ],
+)
+async def test_an_unavailable_server_is_not_logged_as_a_failure(error, caplog) -> None:
+    service, store, _ = _service(error, error)
+
+    await service.merge_standings("s", "t")
+    await service.retry_pending_merges()
+
+    assert store.pending == {("s", "t")}
+    assert all(r.exc_info is None for r in caplog.records)
+
+
 def _merge_result(source_uuid="s", target_uuid="t") -> AccountMergeResult:
     return AccountMergeResult(
         success=True,
@@ -216,7 +258,7 @@ async def test_account_merge_without_distinct_uuids_has_nothing_to_move() -> Non
 
 @pytest.mark.asyncio
 async def test_player_service_reports_the_rating_outcome_on_the_merge_result() -> None:
-    class _PlayerStore:
+    class _Merges:
         async def merge_player_accounts(self, **kwargs):
             return _merge_result()
 
@@ -225,7 +267,10 @@ async def test_player_service_reports_the_rating_outcome_on_the_merge_result() -
             pass
 
     service, _, _ = _service(TimeoutError())
-    players = PlayerService(_PlayerStore(), _Bus(), ratings=service)
+    bus = _Bus()
+    players = PlayerService(
+        MagicMock(), ratings=service, accounts=bus, moderation=bus, merges=_Merges()
+    )
 
     result = await players.merge_player_accounts(
         source_pid=1, target_pid=2, actor_name="a", actor_discord_id=None, reason="r"
@@ -238,7 +283,7 @@ async def test_player_service_reports_the_rating_outcome_on_the_merge_result() -
 
 @pytest.mark.asyncio
 async def test_a_kick_that_cannot_be_sent_does_not_skip_the_rating_merge() -> None:
-    class _PlayerStore:
+    class _Merges:
         async def merge_player_accounts(self, **kwargs):
             return _merge_result()
 
@@ -247,7 +292,10 @@ async def test_a_kick_that_cannot_be_sent_does_not_skip_the_rating_merge() -> No
             raise ConnectionError("redis is down")
 
     service, store, _ = _service(TimeoutError())
-    players = PlayerService(_PlayerStore(), _Bus(), ratings=service)
+    bus = _Bus()
+    players = PlayerService(
+        MagicMock(), ratings=service, accounts=bus, moderation=bus, merges=_Merges()
+    )
 
     with pytest.raises(ConnectionError):
         await players.merge_player_accounts(
@@ -283,17 +331,18 @@ async def test_season_administration_goes_out_as_one_rpc_each() -> None:
 # ------------------------------------------------------------- server fallback
 
 
-def _live(*names: str) -> None:
-    server_registry._servers.clear()
+def _live(*names: str) -> LiveServerRegistry:
+    servers = LiveServerRegistry()
     for name in names:
-        server_registry.update_server(
+        servers.update_server(
             name=name, channel_id=1, players=0, max_players=10, version="1"
         )
+    return servers
 
 
 @pytest.mark.asyncio
 async def test_rpc_client_tries_the_next_server_when_one_stays_silent() -> None:
-    _live("b-server", "a-server")
+    servers = _live("b-server", "a-server")
     tried: list[str] = []
 
     async def call(server: str) -> str:
@@ -302,7 +351,9 @@ async def test_rpc_client_tries_the_next_server_when_one_stays_silent() -> None:
             raise TimeoutError()
         return server
 
-    result = await MindustryRpcClient(SimpleNamespace()).on_any_live_server(call)
+    result = await make_rpc(
+        SimpleNamespace(), rating=SimpleNamespace(), servers=servers
+    ).on_any_live_server(call)
 
     assert result == "b-server"
     assert tried == ["a-server", "b-server"]
@@ -310,7 +361,7 @@ async def test_rpc_client_tries_the_next_server_when_one_stays_silent() -> None:
 
 @pytest.mark.asyncio
 async def test_rpc_client_gives_up_after_a_few_silent_servers() -> None:
-    _live("a", "b", "c", "d", "e")
+    servers = _live("a", "b", "c", "d", "e")
     tried: list[str] = []
 
     async def call(server: str) -> str:
@@ -318,14 +369,16 @@ async def test_rpc_client_gives_up_after_a_few_silent_servers() -> None:
         raise TimeoutError()
 
     with pytest.raises(TimeoutError):
-        await MindustryRpcClient(SimpleNamespace()).on_any_live_server(call)
+        await make_rpc(
+            SimpleNamespace(), rating=SimpleNamespace(), servers=servers
+        ).on_any_live_server(call)
 
     assert len(tried) == MAX_SERVERS_TRIED
 
 
 @pytest.mark.asyncio
 async def test_rpc_client_does_not_ask_another_server_after_a_refusal() -> None:
-    _live("a", "b")
+    servers = _live("a", "b")
     tried: list[str] = []
 
     async def call(server: str) -> str:
@@ -333,7 +386,9 @@ async def test_rpc_client_does_not_ask_another_server_after_a_refusal() -> None:
         raise RpcRejected("x", "REJECTED", "no")
 
     with pytest.raises(RpcRejected):
-        await MindustryRpcClient(SimpleNamespace()).on_any_live_server(call)
+        await make_rpc(
+            SimpleNamespace(), rating=SimpleNamespace(), servers=servers
+        ).on_any_live_server(call)
 
     assert tried == ["a"]
 
@@ -342,7 +397,7 @@ async def test_rpc_client_does_not_ask_another_server_after_a_refusal() -> None:
 async def test_rpc_client_tries_the_next_server_when_one_could_not_carry_it_out() -> (
     None
 ):
-    _live("a", "b")
+    servers = _live("a", "b")
     tried: list[str] = []
 
     async def call(server: str) -> str:
@@ -351,7 +406,12 @@ async def test_rpc_client_tries_the_next_server_when_one_could_not_carry_it_out(
             raise RpcFailed("x", "FAILED", "see the server log")
         return server
 
-    assert await MindustryRpcClient(SimpleNamespace()).on_any_live_server(call) == "b"
+    assert (
+        await make_rpc(
+            SimpleNamespace(), rating=SimpleNamespace(), servers=servers
+        ).on_any_live_server(call)
+        == "b"
+    )
     assert tried == ["a", "b"]
 
 
@@ -359,7 +419,7 @@ async def test_rpc_client_tries_the_next_server_when_one_could_not_carry_it_out(
 async def test_rpc_client_names_a_season_change_once_for_every_server_it_tries() -> (
     None
 ):
-    _live("a", "b")
+    servers = _live("a", "b")
     seen: list[tuple[str, str, str]] = []
 
     class _Bus:
@@ -379,7 +439,7 @@ async def test_rpc_client_names_a_season_change_once_for_every_server_it_tries()
             seen.append(("remove", server, request_id))
             return "removed"
 
-    client = MindustryRpcClient(_Bus())
+    client = make_rpc(SimpleNamespace(), rating=_Bus(), servers=servers)
     actor = {"discord_id": "5", "actor_name": "Head", "timeout_ms": 100}
     await client.reschedule_season(
         ladder="minipvp",
@@ -436,7 +496,7 @@ class _ReplyingRedis:
     [("REJECTED", RpcRejected), ("FAILED", RpcFailed), (None, RpcFailed)],
 )
 async def test_bus_tells_a_refusal_from_a_failure(error_code, expected) -> None:
-    bus = RedisBus(
+    bus = RedisTransport(
         SimpleNamespace(
             redis_url="redis://127.0.0.1:6379",
             redis_group_prefix="xcore:cg",
@@ -446,7 +506,7 @@ async def test_bus_tells_a_refusal_from_a_failure(error_code, expected) -> None:
     bus._redis = _ReplyingRedis(error_code)
 
     with pytest.raises(expected) as raised:
-        await bus._rpc_request(
+        await bus.rpc_request(
             server="mini-pvp",
             rpc_type="rating.accounts.merge.request",
             payload={},
@@ -459,12 +519,12 @@ async def test_bus_tells_a_refusal_from_a_failure(error_code, expected) -> None:
 
 @pytest.mark.asyncio
 async def test_rpc_client_needs_a_live_server() -> None:
-    _live()
+    servers = _live()
 
     with pytest.raises(NoLiveServerError):
-        await MindustryRpcClient(SimpleNamespace()).on_any_live_server(
-            lambda server: None
-        )
+        await make_rpc(
+            SimpleNamespace(), rating=SimpleNamespace(), servers=servers
+        ).on_any_live_server(lambda server: None)
 
 
 # --------------------------------------------------------------------- the bus
@@ -479,7 +539,7 @@ class _Captured:
 
 @pytest.mark.asyncio
 async def test_bus_sends_the_canonical_season_and_merge_requests() -> None:
-    bus = RedisBus(
+    bus = RedisTransport(
         SimpleNamespace(
             redis_url="redis://127.0.0.1:6379",
             redis_group_prefix="xcore:cg",
@@ -516,12 +576,13 @@ async def test_bus_sends_the_canonical_season_and_merge_requests() -> None:
 
         return {"payload_json": json.dumps(body)}
 
-    bus._rpc_request = MethodType(fake_rpc_request, bus)
+    bus.rpc_request = MethodType(fake_rpc_request, bus)
+    rating = RatingBus(bus)
 
-    merged = await bus.rpc_ratings_merge(
+    merged = await rating.rpc_ratings_merge(
         server="mini-pvp", source_uuid="s", target_uuid="t", timeout_ms=100
     )
-    moved = await bus.rpc_season_reschedule(
+    moved = await rating.rpc_season_reschedule(
         server="mini-pvp",
         ladder="minipvp",
         operation=RatingSeasonRescheduleRequestV1Operation.EXTEND,
@@ -539,7 +600,7 @@ async def test_bus_sends_the_canonical_season_and_merge_requests() -> None:
     assert seen[1].payload["actor"]["actorDiscordId"] == "5"
     assert "requestId" not in seen[1].payload
 
-    await bus.rpc_season_reschedule(
+    await rating.rpc_season_reschedule(
         server="mini-pvp",
         ladder="minipvp",
         operation=RatingSeasonRescheduleRequestV1Operation.END_NOW,

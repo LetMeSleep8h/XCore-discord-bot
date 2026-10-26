@@ -59,6 +59,7 @@ class BanRecord:
     ip: str | None = None
     pid: int | None = None
 
+
 def record_identifiers(
     record: PlayerRecord | BanRecord,
 ) -> tuple[str | None, str | None]:
@@ -79,6 +80,7 @@ class MuteRecord:
     uuid: str | None = None
     pid: int | None = None
 
+
 @dataclass(frozen=True, kw_only=True)
 class AuditRecordSummary:
     audit_id: str
@@ -93,6 +95,7 @@ class AuditRecordSummary:
     expires_at: object = None
     occurred_at: object = None
     created_at_epoch_ms: int = 0
+
 
 @dataclass(frozen=True, kw_only=True)
 class AccountMergeResult:

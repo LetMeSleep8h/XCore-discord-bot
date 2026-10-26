@@ -12,7 +12,7 @@ import discord
 from ...dto import BanRecord, PlayerRecord
 from ...i18n import t
 from ...player_pids import NO_PID, or_none
-from ...staff_actions import perform_shorten_ban, perform_unban
+from ...staff_actions import BanNotFound, perform_shorten_ban, perform_unban
 from ...utils.duration import parse_duration
 from ..access import check_opening
 from ..cards import add_sanctions, base_card, safe_text
@@ -71,7 +71,7 @@ def _player_valid(player, *, uuid=None, pid=None, discord_id=None) -> bool:
 
 async def _linked(service, discord_id: str) -> list[PlayerRecord]:
     found = {}
-    for player in await service.players.find_players_by_discord_id(discord_id):
+    for player in await service.player_store.find_players_by_discord_id(discord_id):
         if _player_valid(player, discord_id=discord_id):
             found[player.uuid] = player
     return list(found.values())
@@ -156,7 +156,7 @@ async def _checked(service, ban) -> BanRecord | None:
     if not _active(current, service.now()) or not _same_subject(ban, current):
         return None
     if current.ban_id is None:
-        assigned = await service.players.ensure_ban_id(
+        assigned = await service.punishments.ensure_ban_id(
             uuid=current.uuid or "", ip=current.ip
         )
         if (
@@ -180,16 +180,16 @@ async def _checked(service, ban) -> BanRecord | None:
 async def _lookup(service, reference: str) -> tuple[BanRecord | None, str]:
     kind, number = parse_reference(reference)
     if kind == "ban_id":
-        ban = await service.players.find_ban_by_id(number)
+        ban = await service.punishments.find_ban_by_id(number)
         # An existing expired/malformed ban number must not silently become a PID.
         if ban is not None:
             return await _checked(service, ban), kind
         if not reference.strip().isdigit() or number >= 2**31:
             return None, kind
-    player = await service.players.find_player_by_pid(number)
+    player = await service.player_store.find_player_by_pid(number)
     if not _player_valid(player, pid=number):
         return None, "pid"
-    ban = await service.players.find_ban(
+    ban = await service.punishments.find_ban(
         uuid=player.uuid, ip=player.ip or player.last_ip
     )
     return await _checked(service, ban), "pid"
@@ -256,7 +256,7 @@ async def _history_data(service, uuid, *, exclude=None):
     }
 
 
-async def _submit(
+async def _submit(  # noqa: C901
     context: PanelContext, values: dict[str, str], choice: BanRecord | None = None
 ) -> Case:
     service, user, locale = context.service, context.interaction.user, context.locale
@@ -278,7 +278,7 @@ async def _submit(
     linked = await _linked(service, str(user.id))
     if choice:
         ban = await _checked(
-            service, await service.players.find_ban_by_id(choice.ban_id)
+            service, await service.punishments.find_ban_by_id(choice.ban_id)
         )
         lookup = "link"
         if ban is None or ban.ban_id != choice.ban_id or not _same_subject(choice, ban):
@@ -333,7 +333,7 @@ async def _submit(
     )
     subject_player = verified
     if subject_player is None and ban.uuid:
-        candidate = await service.players.find_player_by_uuid(ban.uuid)
+        candidate = await service.player_store.find_player_by_uuid(ban.uuid)
         if _player_valid(candidate, uuid=ban.uuid):
             subject_player = candidate
     subject = Party(
@@ -447,7 +447,7 @@ async def panel_handler(context: PanelContext):
     for player in await _linked(context.service, str(context.interaction.user.id)):
         ban = await _checked(
             context.service,
-            await context.service.players.find_ban(
+            await context.service.punishments.find_ban(
                 uuid=player.uuid, ip=player.ip or player.last_ip
             ),
         )
@@ -537,7 +537,7 @@ async def _current(context, claimed):
         or claimed.dedup_key != f"appeal:{ban_id}"
     ):
         raise ActionFailed(t(context.locale, "appeals-stale"))
-    ban = await _checked(service, await service.players.find_ban_by_id(ban_id))
+    ban = await _checked(service, await service.punishments.find_ban_by_id(ban_id))
     reference = claimed.payload.get("ban_reference", {})
     if (
         ban is None
@@ -569,51 +569,28 @@ async def _current(context, claimed):
     return ban
 
 
-class _ActionStore:
-    """The real helper's DB calls retain the case's authorization/subject boundary.
+def _still_current(context, claimed, expiry: datetime | None = None):
+    """The check a staff action runs right before it changes the appealed ban.
 
-    Helpers may read the ban again. Validate that fresh read too, and check immediately
-    before mutation. The final DB write still uses the existing ban-ID guard; this is
-    not an atomic issuer/read/write transaction with concurrent external editors.
+    Re-reads the ban, so the subject and issuer are validated and authorized again just
+    before the write. The write itself keeps the ban-ID guard; this is not an atomic
+    read-and-write against concurrent external editors.
     """
 
-    def __init__(self, context, claimed):
-        self.context, self.claimed = context, claimed
-
-    def __getattr__(self, name):
-        return getattr(self.context.service.bot.store, name)
-
-    async def find_ban_by_id(self, ban_id):
-        if ban_id != self.claimed.payload["ban_id"]:
-            raise ActionFailed(t(self.context.locale, "appeals-stale"))
-        return await _current(self.context, self.claimed)
-
-    async def delete_ban(self, *, uuid, ip, ban_id):
-        ban = await _current(self.context, self.claimed)
-        if (uuid, ip, ban_id) != (ban.uuid or "", ban.ip, ban.ban_id):
-            raise ActionFailed(t(self.context.locale, "appeals-stale"))
-        return await self.context.service.bot.store.delete_ban(
-            uuid=uuid, ip=ip, ban_id=ban_id
-        )
-
-    async def update_ban_expiry(self, *, ban_id, new_expiry):
-        ban = await self.find_ban_by_id(ban_id)
-        if utc(new_expiry) <= utc(self.context.service.now()) or (
-            ban.expire_date is not None and utc(new_expiry) >= utc(ban.expire_date)
+    async def check(ban: BanRecord) -> None:
+        current = await _current(context, claimed)
+        if (ban.ban_id, ban.uuid, ban.ip) != (current.ban_id, current.uuid, current.ip):
+            raise ActionFailed(t(context.locale, "appeals-stale"))
+        if expiry is not None and (
+            utc(expiry) <= utc(context.service.now())
+            or (
+                current.expire_date is not None
+                and utc(expiry) >= utc(current.expire_date)
+            )
         ):
-            raise ActionFailed(t(self.context.locale, "appeals-duration-invalid"))
-        return await self.context.service.bot.store.update_ban_expiry(
-            ban_id=ban_id, new_expiry=new_expiry
-        )
+            raise ActionFailed(t(context.locale, "appeals-duration-invalid"))
 
-
-class _ActionBot:
-    def __init__(self, context, claimed):
-        self._bot = context.service.bot
-        self.store = _ActionStore(context, claimed)
-
-    def __getattr__(self, name):
-        return getattr(self._bot, name)
+    return check
 
 
 async def unban(context):
@@ -630,13 +607,18 @@ async def unban(context):
 
     async def action(claimed):
         ban = await _current(context, claimed)
-        result = await perform_unban(
-            _ActionBot(context, claimed),
-            ban,
-            context.actor,
-            case_number=claimed.number,
-            case_action_token=claimed.pending_action["token"],
-        )
+        try:
+            result = await perform_unban(
+                context.service.bot,
+                ban,
+                context.actor,
+                case_number=claimed.number,
+                case_action_token=claimed.pending_action["token"],
+                check=_still_current(context, claimed),
+            )
+        except BanNotFound as error:
+            # Lifted or replaced since it was read: the appeal no longer applies.
+            raise ActionFailed(t(context.locale, "appeals-stale")) from error
         return Resolution("unbanned", ban_id=ban.ban_id, audit_id=result.audit_id)
 
     return await context.run(action)
@@ -654,14 +636,18 @@ async def shorten(context):
             ban.expire_date is not None and expiry >= utc(ban.expire_date)
         ):
             raise ActionFailed(t(context.locale, "appeals-duration-invalid"))
-        result = await perform_shorten_ban(
-            _ActionBot(context, claimed),
-            ban.ban_id,
-            expiry,
-            context.actor,
-            case_number=claimed.number,
-            case_action_token=claimed.pending_action["token"],
-        )
+        try:
+            result = await perform_shorten_ban(
+                context.service.bot,
+                ban.ban_id,
+                expiry,
+                context.actor,
+                case_number=claimed.number,
+                case_action_token=claimed.pending_action["token"],
+                check=_still_current(context, claimed, expiry),
+            )
+        except BanNotFound as error:
+            raise ActionFailed(t(context.locale, "appeals-stale")) from error
         return Resolution(
             "shortened",
             ban_id=ban.ban_id,
@@ -674,7 +660,7 @@ async def shorten(context):
 
 async def history(context):
     # Stored issuer conflict already checked by core; current issuer is checked when present.
-    current = await context.service.players.find_ban_by_id(
+    current = await context.service.punishments.find_ban_by_id(
         context.case.payload["ban_id"]
     )
     if current is not None:

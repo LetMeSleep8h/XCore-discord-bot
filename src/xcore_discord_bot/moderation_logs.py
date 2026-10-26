@@ -82,17 +82,17 @@ async def _case_log_secrets(
     bot, number: int, supplied: tuple[str, ...], actor_id: str | None
 ) -> tuple[str, ...]:
     service = bot.container.cases
-    if service is None:
-        return supplied
     case = await service.get(number)
     secrets = [*supplied, *case_secrets(case)]
-    if service.players is not None:
+    if service.player_store is not None:
         for uuid in case_secrets(case):
-            player = await service.players.find_player_by_uuid(uuid)
+            player = await service.player_store.find_player_by_uuid(uuid)
             if player is not None and player.ip:
                 secrets.append(player.ip)
         if actor_id:
-            for player in await service.players.find_players_by_discord_id(actor_id):
+            for player in await service.player_store.find_players_by_discord_id(
+                actor_id
+            ):
                 secrets.extend((player.uuid or "", player.ip or ""))
     return tuple(secrets)
 
@@ -161,7 +161,9 @@ async def post_ban_log(
         if player is not None:
             uuid_value, ip_value = record_identifiers(player)
             if uuid_value is not None or ip_value is not None:
-                ban = await bot.store.ensure_ban_id(uuid=uuid_value or "", ip=ip_value)
+                ban = await bot.container.punishments.ensure_ban_id(
+                    uuid=uuid_value or "", ip=ip_value
+                )
                 if ban is not None:
                     ban_id = ban.ban_id
                     if case_number is None:

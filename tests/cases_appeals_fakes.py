@@ -1,5 +1,6 @@
 """B6 fakes run real staff helpers and Mongo mutation guards; no external services."""
 
+from bot_fakes import FAMILY_BUSES
 from cases_action_fakes import Claims, Players, mirror_audits
 from cases_fakes import NOW, Interaction, core, member
 from test_staff_actions import _action_bot
@@ -57,14 +58,19 @@ async def appeal_core(*, players=None, bans=None, enabled=True, **settings):
     action_bot.store.now_utc = lambda: NOW
     # Same raw bans as the real Mongo helper. Core cases/audits retain their richer fakes.
     database.collections["bans"] = mutations["bans"]
-    service.players = Players(action_bot, mutations)
-    service.notifier.find_player = service.players.find_player_by_uuid
+    service.player_store = Players(action_bot, mutations)
+    service.punishments = action_bot.container.punishments
+    service.notifier.find_player = service.player_store.find_player_by_uuid
     service.claims = Claims()
     bot.settings = service.settings.model_copy(
         update={"discord_bans_channel_id": 10, "discord_mutes_channel_id": 20}
     )
     bot.store = action_bot.store
     bot.bus = action_bot.bus
+    for family in FAMILY_BUSES:
+        setattr(bot.container, family, getattr(action_bot.container, family))
+    bot.container.punishments = action_bot.container.punishments
+    bot.container.audit = action_bot.container.audit
     bot.resolve_channel = action_bot.resolve_channel
 
     mirror_audits(bot, action_bot, database, mutations)

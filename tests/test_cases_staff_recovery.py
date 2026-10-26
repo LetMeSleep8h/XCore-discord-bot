@@ -107,11 +107,11 @@ async def test_real_helpers_recover_durable_completion_without_replaying(
     if action in {"ban", "mute", "shorten"}:
         channel.send = AsyncMock(side_effect=RuntimeError("log unavailable"))
     if action == "unban":
-        bot.bus.publish_pardon_player = AsyncMock(
+        bot.container.moderation_bus.publish_pardon_player = AsyncMock(
             side_effect=RuntimeError("pardon unavailable")
         )
     if action == "grant":
-        bot.bus.publish_player_badge_inventory_changed = AsyncMock(
+        bot.container.accounts_bus.publish_player_badge_inventory_changed = AsyncMock(
             side_effect=RuntimeError("inventory unavailable")
         )
 
@@ -138,7 +138,7 @@ async def test_real_helpers_recover_durable_completion_without_replaying(
             )
         elif action == "unban":
             await perform_unban(
-                bot, await bot.store.find_ban_by_id(71), actor, **kwargs
+                bot, await bot.container.punishments.find_ban_by_id(71), actor, **kwargs
             )
         elif action == "shorten":
             await perform_shorten_ban(bot, 71, NOW + timedelta(days=1), actor, **kwargs)
@@ -195,9 +195,9 @@ async def test_real_completion_survives_failed_case_cas_or_post_grant_lookup(mod
         bot.store.find_player_by_uuid = AsyncMock(
             side_effect=RuntimeError("fresh lookup failed")
         )
-    finish = service._finish_action
+    finish = service.actions._finish
     if mode != "badge_lookup":
-        service._finish_action = AsyncMock(side_effect=CaseRace())
+        service.actions._finish = AsyncMock(side_effect=CaseRace())
 
     async def callback(claimed):
         if kind == "map":
@@ -231,7 +231,7 @@ async def test_real_completion_survives_failed_case_cas_or_post_grant_lookup(mod
                 callback,
             )
         assert (await service.get(case.number)).pending_action
-    service._finish_action = finish
+    service.actions._finish = finish
     await reconcile_cases(service)
     await reconcile_cases(service)
     final = await service.get(case.number)
@@ -268,7 +268,7 @@ async def test_real_map_unconfirmed_results_stay_open_and_never_retry(status):
     if status == "timeout":
         bus.upload_error = TimeoutError("installed remotely but no receipt")
     elif status == "audit_failed":
-        bot.store.append_moderation_audit = AsyncMock(
+        bot.container.audit.append_moderation_audit = AsyncMock(
             side_effect=ValueError("audit unavailable")
         )
     else:
@@ -324,7 +324,7 @@ async def test_real_mutation_without_completion_audit_remains_uncertain(kind):
         kind, payload={"ban_id": 71} if kind == "appeal" else {"badge": "map-maker"}
     )
     mutation_db["bans"].docs = [_ban(ban_id=71, expire_date=NOW + timedelta(days=7))]
-    bot.store.append_moderation_audit = AsyncMock(
+    bot.container.audit.append_moderation_audit = AsyncMock(
         side_effect=RuntimeError("audit unavailable")
     )
     calls = []
@@ -334,7 +334,7 @@ async def test_real_mutation_without_completion_audit_remains_uncertain(kind):
         if kind == "appeal":
             await perform_unban(
                 bot,
-                await bot.store.find_ban_by_id(71),
+                await bot.container.punishments.find_ban_by_id(71),
                 service.actor(member()),
                 **context(claimed),
             )

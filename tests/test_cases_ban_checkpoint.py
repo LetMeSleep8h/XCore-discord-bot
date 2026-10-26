@@ -10,12 +10,14 @@ import pytest
 from bot_fakes import make_bot, make_settings
 from fakeredis.aioredis import FakeRedis
 
-from xcore_discord_bot import redis_bus as bus_module
 from xcore_discord_bot import runtime_consumers
+from xcore_discord_bot.bus import transport as bus_module
+from xcore_discord_bot.bus.moderation import ModerationBus
+from xcore_discord_bot.bus.transport import RedisTransport
 from xcore_discord_bot.contracts import ModerationBanCreatedV1, parse_ban_payload
 from xcore_discord_bot.moderation_logs import post_ban_log
 from xcore_discord_bot.player_pids import NO_PID
-from xcore_discord_bot.redis_bus import RedisBus
+from xcore_discord_bot.registry import LiveServerRegistry
 
 STREAM = "xcore:evt:moderation:ban"
 GROUP = "xcore:cg:discord-ban"
@@ -41,7 +43,7 @@ def legacy_payload(pid=-5, ban_id=None):
 @pytest.fixture
 async def bus():
     redis = FakeRedis(decode_responses=True)
-    bus = RedisBus(
+    bus = RedisTransport(
         SimpleNamespace(redis_group_prefix="xcore:cg", redis_consumer_name="bot")
     )
     bus._redis = redis
@@ -147,9 +149,10 @@ async def test_distinct_legacy_bans_log_and_reclaim_retries_hooks_after_restart(
         assert call.args[2].to_payload() == payload
 
     # The marker belongs to the envelope delivery, and survives a new bus instance.
-    restarted = RedisBus(bus._settings)
+    restarted = RedisTransport(bus._settings)
     restarted._redis = bus._redis
     bot.bus = restarted
+    bot.container.moderation_bus = ModerationBus(restarted, LiveServerRegistry())
     await reclaim_bans(monkeypatch, bot)
     assert channel.send.await_count == 2
     assert hook.await_count == 4
@@ -158,7 +161,9 @@ async def test_distinct_legacy_bans_log_and_reclaim_retries_hooks_after_restart(
 
     # A later direct invocation of the same generated object has no stream identity.
     direct_log = AsyncMock()
-    await bus.run_ban_log_once(hook.await_args_list[1].args[2], direct_log)
+    await ModerationBus(bus, LiveServerRegistry()).run_ban_log_once(
+        hook.await_args_list[1].args[2], direct_log
+    )
     direct_log.assert_awaited_once_with()
     assert len(await bus._redis.keys(MARKERS)) == 2
 
@@ -183,7 +188,7 @@ async def test_missing_event_id_fallback_includes_source_stream(bus):
     log = AsyncMock()
 
     async def callback(event):
-        await bus.run_ban_log_once(event, log)
+        await ModerationBus(bus, LiveServerRegistry()).run_ban_log_once(event, log)
 
     for stream in (STREAM, "xcore:evt:moderation:ban:legacy"):
         await add_ban(bus, stream=stream, message_id="1-0")
@@ -230,9 +235,10 @@ async def test_unresolved_channel_retries_send_then_retries_case_hook(bus, monke
     assert hook.await_count == 1
     assert (await bus._redis.xpending(STREAM, GROUP))["pending"] == 1
 
-    restarted = RedisBus(bus._settings)
+    restarted = RedisTransport(bus._settings)
     restarted._redis = bus._redis
     bot.bus = restarted
+    bot.container.moderation_bus = ModerationBus(restarted, LiveServerRegistry())
     await reclaim_bans(monkeypatch, bot)
     channel.send.assert_awaited_once()
     assert resolver.await_count == 2
@@ -311,7 +317,7 @@ async def test_cancelled_callback_cleans_up_delivery_identity_without_mark_or_ac
 
     async def callback(event):
         seen.append(event)
-        await bus.run_ban_log_once(
+        await ModerationBus(bus, LiveServerRegistry()).run_ban_log_once(
             event, AsyncMock(side_effect=asyncio.CancelledError())
         )
 
@@ -327,7 +333,7 @@ async def test_cancelled_callback_cleans_up_delivery_identity_without_mark_or_ac
     assert await bus._redis.keys(MARKERS) == []
     assert (await bus._redis.xpending(STREAM, GROUP))["pending"] == 1
     direct_log = AsyncMock()
-    await bus.run_ban_log_once(seen[0], direct_log)
+    await ModerationBus(bus, LiveServerRegistry()).run_ban_log_once(seen[0], direct_log)
     direct_log.assert_awaited_once_with()
     assert await bus._redis.keys(MARKERS) == []
 

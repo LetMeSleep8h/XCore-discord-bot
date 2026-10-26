@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
 
-from ..dto import MERGE_KEEP_PID_TARGET, AccountMergeResult, PlayerRecord
+from ..account_merge_store import AccountMergeStore
+from ..bus.accounts import AccountsBus
+from ..bus.moderation import ModerationBus
+from ..dto import MERGE_KEEP_PID_TARGET, AccountMergeResult
 from ..mongo_store import MongoStore
-from ..redis_bus import RedisBus
 from ..rpc.mindustry_rpc import MindustryRpcClient
 from ..settings import Settings
 from .rating_service import RatingService
@@ -15,33 +16,21 @@ class PlayerService:
     def __init__(
         self,
         store: MongoStore,
-        bus: RedisBus,
         ratings: RatingService | None = None,
         settings: Settings | None = None,
         rpc: MindustryRpcClient | None = None,
+        *,
+        accounts: AccountsBus,
+        moderation: ModerationBus,
+        merges: AccountMergeStore,
     ) -> None:
         self._store = store
-        self._bus = bus
+        self._merges = merges
+        self._accounts = accounts
+        self._moderation = moderation
         self._ratings = ratings
         self._settings = settings
         self._rpc = rpc
-
-    async def autocomplete_players(self, current: str) -> list[PlayerRecord]:
-        return await self._store.autocomplete_players(current)
-
-    async def count_players_by_name(self, name: str) -> int:
-        return await self._store.count_players_by_name(name)
-
-    async def search_players(
-        self,
-        *,
-        query: str,
-        limit: int = 10,
-    ) -> list[PlayerRecord]:
-        return await self._store.search_players(query=query, limit=limit)
-
-    async def find_player_by_pid(self, pid: int) -> PlayerRecord | None:
-        return await self._store.find_player_by_pid(pid)
 
     async def merge_player_accounts(
         self,
@@ -53,7 +42,7 @@ class PlayerService:
         reason: str,
         keep_pid: str = MERGE_KEEP_PID_TARGET,
     ) -> AccountMergeResult:
-        result = await self._store.merge_player_accounts(
+        result = await self._merges.merge_player_accounts(
             source_pid=source_pid,
             target_pid=target_pid,
             actor_name=actor_name,
@@ -64,11 +53,11 @@ class PlayerService:
         kick_error: Exception | None = None
         if result.success and result.source_before and result.source_before.uuid:
             try:
-                await self._bus.publish_kick_banned(
+                await self._moderation.publish_kick_banned(
                     uuid_value=result.source_before.uuid,
                     ip=None,
                 )
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 -- re-raised after the ratings below
                 # The accounts are merged already; a kick that could not be sent must not
                 # leave the ratings behind unattempted and unqueued.
                 kick_error = error
@@ -85,18 +74,6 @@ class PlayerService:
             raise kick_error
         return result
 
-    async def find_player_by_uuid(self, uuid: str) -> PlayerRecord | None:
-        return await self._store.find_player_by_uuid(uuid)
-
-    async def find_players_by_discord_id(self, discord_id: str) -> list[PlayerRecord]:
-        return await self._store.find_players_by_discord_id(discord_id)
-
-    async def find_discord_admin_players(self) -> list[PlayerRecord]:
-        return await self._store.find_discord_admin_players()
-
-    async def find_discord_link_code(self, code: str) -> dict[str, Any] | None:
-        return await self._bus.get_discord_link_code(code)
-
     async def reset_password(self, *, uuid: str) -> bool:
         if self._settings is not None and self._settings.permissions_mode == "roles":
             assert self._rpc is not None
@@ -108,80 +85,5 @@ class PlayerService:
             return response.changed
         updated = await self._store.reset_password(uuid=uuid)
         if updated:
-            await self.publish_player_password_reset(uuid_value=uuid)
+            await self._accounts.publish_player_password_reset(uuid_value=uuid)
         return updated
-
-    async def grant_badge(self, *, uuid: str, badge_id: str) -> bool:
-        return await self._store.grant_badge(uuid=uuid, badge_id=badge_id)
-
-    async def revoke_badge(self, *, uuid: str, badge_id: str) -> bool:
-        return await self._store.revoke_badge(uuid=uuid, badge_id=badge_id)
-
-    async def publish_player_active_badge_changed(
-        self,
-        *,
-        uuid_value: str,
-        active_badge: str | None,
-    ) -> None:
-        await self._bus.publish_player_active_badge_changed(
-            uuid_value=uuid_value,
-            active_badge=active_badge,
-        )
-
-    async def publish_player_badge_inventory_changed(
-        self,
-        *,
-        uuid_value: str,
-        active_badge: str | None,
-        unlocked_badges: list[str] | tuple[str, ...],
-    ) -> None:
-        await self._bus.publish_player_badge_inventory_changed(
-            uuid_value=uuid_value,
-            active_badge=active_badge,
-            unlocked_badges=unlocked_badges,
-        )
-
-    async def publish_player_password_reset(self, *, uuid_value: str) -> None:
-        if self._settings is not None and self._settings.permissions_mode == "roles":
-            return
-        await self._bus.publish_player_password_reset(uuid_value=uuid_value)
-
-    async def publish_discord_link_confirm(
-        self,
-        *,
-        code: str,
-        player_uuid: str,
-        player_pid: int,
-        player_name: str,
-        discord_id: str,
-        discord_username: str,
-    ) -> None:
-        await self._bus.publish_discord_link_confirm(
-            code=code,
-            player_uuid=player_uuid,
-            player_pid=player_pid,
-            player_name=player_name,
-            discord_id=discord_id,
-            discord_username=discord_username,
-        )
-
-    async def publish_discord_unlink(
-        self,
-        *,
-        player_uuid: str,
-        player_pid: int,
-        player_name: str,
-        discord_id: str,
-        discord_username: str,
-        actor_name: str,
-        actor_discord_id: str,
-    ) -> None:
-        await self._bus.publish_discord_unlink(
-            player_uuid=player_uuid,
-            player_pid=player_pid,
-            player_name=player_name,
-            discord_id=discord_id,
-            discord_username=discord_username,
-            actor_name=actor_name,
-            actor_discord_id=actor_discord_id,
-        )

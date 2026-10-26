@@ -9,23 +9,24 @@ from discord import Interaction, app_commands
 from discord.abc import Messageable
 from discord.ext import commands
 
+from .bus.transport import RedisTransport
 from .cases._privacy import private_case_command
 from .cases.redis_transport import RedisCaseTransport
 from .cases.views import CaseActionButton, PanelButton
 from .cogs import AdminCog, InfoCog, LinkingCog, MapsCog, SeasonsCog, SubnetCog
 from .cogs.cases import CasesCog
 from .container import ServiceContainer
-from .i18n import XCoreTranslator
+from .i18n import XCoreTranslator, resolve_dm_locale, t
 from .mongo_store import MongoStore
-from .redis_bus import RedisBus
-from .registry import server_registry
 from .settings import Settings
 
 logger = logging.getLogger(__name__)
 
 
 class XCoreDiscordBot(commands.Bot):
-    def __init__(self, settings: Settings, bus: RedisBus, store: MongoStore) -> None:
+    def __init__(
+        self, settings: Settings, bus: RedisTransport, store: MongoStore
+    ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
         intents.members = True
@@ -45,7 +46,7 @@ class XCoreDiscordBot(commands.Bot):
         )
         if settings.cases_enabled:
             self.container.cases.set_transport(
-                RedisCaseTransport(self.bus, self.container.rpc)
+                RedisCaseTransport(self.container.cases_bus, self.container.rpc)
             )
         self.map_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
 
@@ -140,12 +141,14 @@ class XCoreDiscordBot(commands.Bot):
 
         await self.bus.connect()
         await self.store.connect()
+        await self.container.punishments.ensure_indexes()
+        await self.container.audit.ensure_indexes()
         container = self.container
         if self.settings.cases_enabled:
             try:
                 await container.cases.store.load_locale_prefs()
                 await container.cases.store.ensure_indexes()
-            except Exception:
+            except Exception:  # the bot still starts with cases disabled
                 logger.exception(
                     "Cases storage initialization failed; flows stay disabled"
                 )
@@ -187,17 +190,19 @@ class XCoreDiscordBot(commands.Bot):
         logger.info("Discord bot connected as %s", self.user)
         await self.container.presence_daemon.update_presence_once()
         try:
-            daemon = (
-                self.container.staff_sync_daemon or self.container.admin_sync_daemon
-            )
-            result = await daemon.reconcile()
-            logger.info(
-                "Startup admin reconcile complete: applied=%s revoked=%s discord_admins=%s",
-                result.get("applied", result.get("synced", 0)),
-                result.get("revoked", 0),
-                result.get("discord_admins", 0),
-            )
-        except Exception:
+            staff_sync = self.container.staff_sync_daemon
+            if staff_sync is not None:
+                # The pass logs its own summary.
+                await staff_sync.reconcile()
+            else:
+                result = await self.container.admin_sync_daemon.reconcile()
+                logger.info(
+                    "Startup admin reconcile complete: applied=%s revoked=%s discord_admins=%s",
+                    len(result.applied),
+                    len(result.revoked),
+                    result.discord_admins,
+                )
+        except Exception:  # the periodic pass retries it
             logger.exception("Startup admin reconcile failed")
 
     async def on_message(self, message: discord.Message) -> None:
@@ -209,7 +214,7 @@ class XCoreDiscordBot(commands.Bot):
         if isinstance(message.channel, discord.DMChannel):
             code = message.content.strip().upper()
             if code:
-                code_doc = await self.bus.get_discord_link_code(code)
+                code_doc = await self.container.accounts_bus.get_discord_link_code(code)
                 player = None
                 if code_doc is not None:
                     player = await self.store.find_player_by_uuid(
@@ -224,15 +229,16 @@ class XCoreDiscordBot(commands.Bot):
                     and player.uuid is not None
                     and code_doc is not None
                 ):
+                    locale = await resolve_dm_locale(
+                        message.author.id, self.container.cases.store, player.language
+                    )
                     if player.discord_id and player.discord_id != str(
                         message.author.id
                     ):
-                        await message.channel.send(
-                            "This Mindustry account is already linked to another Discord account."
-                        )
+                        await message.channel.send(t(locale, "link-taken"))
                         return
 
-                    await self.bus.publish_discord_link_confirm(
+                    await self.container.accounts_bus.publish_discord_link_confirm(
                         code=code,
                         player_uuid=player.uuid,
                         player_pid=player.pid,
@@ -241,15 +247,22 @@ class XCoreDiscordBot(commands.Bot):
                         discord_username=message.author.display_name,
                     )
                     await message.channel.send(
-                        f"Link request sent for `{player.nickname}` (`pid={player.pid}`)."
+                        t(
+                            locale,
+                            "link-dm-sent",
+                            name=player.nickname or "",
+                            pid=player.pid,
+                        )
                     )
                     return
 
-        target_server = server_registry.get_server_for_channel(message.channel.id)
+        target_server = self.container.servers.get_server_for_channel(
+            message.channel.id
+        )
         if target_server is None or not message.content:
             return
 
-        await self.bus.publish_discord_message(
+        await self.container.chat_bus.publish_discord_message(
             server=target_server,
             author_name=message.author.display_name,
             message=message.content,
@@ -259,22 +272,19 @@ class XCoreDiscordBot(commands.Bot):
     async def _dispatch_case_hook(self, hook: str, value: object) -> None:
         # With every cases flag off no flow is enabled and the registry returns at once.
         cases = self.container.cases
-        if cases is not None:
-            await cases.registry.dispatch(hook, cases, value)
+        await cases.registry.dispatch(hook, cases, value)
 
     async def on_interaction(self, interaction: Interaction) -> None:
         # An observer, not a response handler: it never delays a modal or command
         # acknowledgement. It keeps the ``auto`` language row fresh for later DMs.
-        cases = self.container.cases
         if (
-            cases is None
-            or not self.settings.cases_enabled
+            not self.settings.cases_enabled
             or interaction.type == discord.InteractionType.autocomplete
         ):
             return
         try:
-            await cases.store.remember_interaction(interaction)
-        except Exception:
+            await self.container.cases.store.remember_interaction(interaction)
+        except Exception:  # an observer must not fail the interaction
             logger.exception("Could not refresh Discord locale preference")
 
     async def on_thread_create(self, thread: discord.Thread) -> None:
@@ -284,8 +294,7 @@ class XCoreDiscordBot(commands.Bot):
         await self._dispatch_case_hook("on_thread_delete", payload)
 
     async def close(self) -> None:
-        if self.container.cases_reconcile_daemon is not None:
-            await self.container.cases_reconcile_daemon.stop()
+        await self.container.cases_reconcile_daemon.stop()
         self.container.presence_daemon.stop()
         self.container.admin_sync_daemon.stop()
         if self.container.staff_sync_daemon is not None:
@@ -321,7 +330,7 @@ class XCoreDiscordBot(commands.Bot):
 
         return channel
 
-    async def handle_app_command_error(
+    async def handle_app_command_error(  # noqa: C901
         self,
         interaction: Interaction,
         error: app_commands.AppCommandError,
@@ -350,7 +359,7 @@ class XCoreDiscordBot(commands.Bot):
                     )
                     embed.add_field(name="Error ID", value=error_id, inline=False)
                     await channel.send(embed=embed)
-            except Exception:
+            except Exception:  # noqa: BLE001 -- logged by reference; details stay private
                 logger.error("Private cases error delivery failed [ref=%s]", error_id)
             return
         if isinstance(error, app_commands.CheckFailure):
@@ -408,7 +417,7 @@ class XCoreDiscordBot(commands.Bot):
         embed.add_field(name="User", value=f"{user_name} (id={user_id})", inline=False)
         try:
             await channel.send(embed=embed)
-        except Exception:
+        except Exception:  # error reporting must not raise
             logger.warning("Failed to send error log embed", exc_info=True)
 
     @staticmethod

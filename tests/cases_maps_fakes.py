@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import discord
+from bot_fakes import make_rpc
 from cases_badges_fakes import badge_core
 from cases_fakes import NOW, Message, Thread, member
 from test_cases_msav import msav
@@ -9,6 +10,7 @@ from test_cases_msav import msav
 from xcore_discord_bot.cases.flows.maps import MAP_FLOW
 from xcore_discord_bot.cases.model import CaseKind
 from xcore_discord_bot.cases.msav import validate_msav
+from xcore_discord_bot.registry import LiveServerRegistry
 
 
 class Attachment:
@@ -30,6 +32,10 @@ async def map_core(**kwargs):
     service.registry.enable(CaseKind.MAP)
     bot.map_cache = {}
     bot.bus.rpc_upload_maps = bus.rpc_upload_maps
+    # Tests swap the upload RPC on bot.bus while a case runs.
+    bot.container.servers = LiveServerRegistry()
+    bot.container.servers.update_server("mini-pvp", 1, 0, 20, "v1", mode="pvp")
+    bot.container.rpc = make_rpc(bot.bus, maps=bot.bus, servers=bot.container.servers)
     author.bot = False
     author.name = "mapper"
     forum = bot.channels[400]
